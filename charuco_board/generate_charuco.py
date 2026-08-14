@@ -16,7 +16,8 @@ DEFAULT_SQUARES_X = 10
 DEFAULT_SQUARES_Y = 7
 DEFAULT_SQUARE_SIZE_MM = 70.0
 DEFAULT_MARKER_PROPORTION = 0.7
-DEFAULT_DICTIONARY = "DICT_4X4_50"
+DEFAULT_DICTIONARY = "auto"
+PREFERRED_DICTIONARY = "DICT_4X4_50"
 DEFAULT_DPI = 300
 DEFAULT_MARGIN_MM = 0.0
 DEFAULT_OUTPUT = "auto"
@@ -27,6 +28,7 @@ DEFAULT_CROP_MARK_MM = 5.0
 DEFAULT_CROP_STROKE_MM = 0.3
 DEFAULT_TILE_LABEL_PT = 8.0
 DEFAULT_MINIMAP_MAX_PX = 2000
+DETAIL_GRAY = 0.3
 
 PAPER_SIZES_MM = {
     "A0": (841.0, 1189.0),
@@ -60,7 +62,21 @@ def _parse_args() -> argparse.Namespace:
         "--square-size",
         type=float,
         default=DEFAULT_SQUARE_SIZE_MM,
-        help=f"Square side length in millimeters. Default: {DEFAULT_SQUARE_SIZE_MM}.",
+        help=(
+            "Exact square side length in millimetres. With --paper/--size and no "
+            "square counts, packs as many squares as will fit at this size. "
+            f"Default: {DEFAULT_SQUARE_SIZE_MM}."
+        ),
+    )
+    parser.add_argument(
+        "--target-square-size",
+        type=float,
+        default=None,
+        help=(
+            "Target square side in millimetres. With --paper/--size and no square "
+            "counts, picks how many squares fit then resizes them to fill the page. "
+            "Cannot be combined with --square-size."
+        ),
     )
     parser.add_argument(
         "--marker-proportion",
@@ -71,20 +87,38 @@ def _parse_args() -> argparse.Namespace:
             f"Default: {DEFAULT_MARKER_PROPORTION}."
         ),
     )
+    paper_choices = ", ".join(PAPER_SIZES_MM)
     parser.add_argument(
         "--dictionary",
         default=DEFAULT_DICTIONARY,
-        help=f"OpenCV aruco dictionary name (e.g. DICT_4X4_50). Default: {DEFAULT_DICTIONARY}.",
+        help=(
+            "OpenCV aruco dictionary name, or 'auto' to pick the smallest 4X4 "
+            f"dictionary that fits the board. Default: {DEFAULT_DICTIONARY}."
+        ),
     )
     parser.add_argument(
         "--paper",
         default=None,
-        help="Paper size (e.g. A4, A3, Letter). Default: A4 when used.",
+        help=(
+            f"Main board size by paper name. Available: {paper_choices}. "
+            "Use --size for a custom millimetre size."
+        ),
+    )
+    parser.add_argument(
+        "--size",
+        default=None,
+        help=(
+            "Main board size in millimetres as WIDTHxHEIGHT (e.g. 500x700). "
+            "Alternative to --paper. Required with --tile-paper if --paper is omitted."
+        ),
     )
     parser.add_argument(
         "--tile-paper",
         default=None,
-        help="Tile paper size for multipage output (e.g. A3). Requires --paper.",
+        help=(
+            "Tile paper size for multipage output. "
+            f"Available: {paper_choices}. Requires --paper or --size."
+        ),
     )
     parser.add_argument(
         "--dpi",
@@ -127,13 +161,77 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _dictionary_names() -> list[str]:
+    return sorted(name for name in dir(aruco) if name.startswith("DICT_"))
+
+
+def _dictionary_size(dictionary) -> int:
+    return int(np.asarray(dictionary.bytesList).shape[0])
+
+
 def _get_dictionary(name: str):
     if not hasattr(aruco, name):
-        available = [k for k in dir(aruco) if k.startswith("DICT_")]
-        raise SystemExit(
-            f"Unknown dictionary '{name}'. Available examples: {', '.join(sorted(available)[:8])}"
-        )
+        available = ", ".join(_dictionary_names())
+        raise SystemExit(f"Unknown dictionary '{name}'. Available: {available}")
     return aruco.getPredefinedDictionary(getattr(aruco, name))
+
+
+def _board_required_marker_count(board) -> int:
+    # ChArUco ids are 0..n-1; OpenCV asserts id < dictionary.bytesList.rows when drawing.
+    if hasattr(board, "getIds"):
+        ids = np.asarray(board.getIds()).reshape(-1)
+    elif hasattr(board, "ids"):
+        ids = np.asarray(board.ids).reshape(-1)
+    else:
+        size = board.getChessboardSize()
+        return int(size[0] * size[1]) // 2
+    if ids.size == 0:
+        return 0
+    return int(ids.max()) + 1
+
+
+def _dictionaries_large_enough(needed: int) -> list[str]:
+    all_names = _dictionary_names()
+    name_set = set(all_names)
+    ranked: list[tuple[int, str]] = []
+    for name in all_names:
+        # OpenCV exposes duplicate AprilTag aliases that differ only by case.
+        if name != name.upper() and name.upper() in name_set:
+            continue
+        size = _dictionary_size(aruco.getPredefinedDictionary(getattr(aruco, name)))
+        if size >= needed:
+            ranked.append((size, name))
+    ranked.sort(key=lambda item: (0 if "4X4" in item[1] else 1, item[0], item[1]))
+    return [name for _, name in ranked]
+
+
+def _select_dictionary(needed: int) -> str:
+    suggestions = _dictionaries_large_enough(needed)
+    if not suggestions:
+        raise SystemExit(
+            f"This board needs {needed} unique ArUco markers, "
+            "but no available OpenCV dictionary is large enough."
+        )
+    return suggestions[0]
+
+
+def _ensure_dictionary_covers_board(dictionary, board, dictionary_name: str) -> None:
+    needed = _board_required_marker_count(board)
+    available = _dictionary_size(dictionary)
+    if needed <= available:
+        return
+    suggestions = _dictionaries_large_enough(needed)
+    hint = ""
+    if suggestions:
+        hint = f" Try --dictionary {suggestions[0]}."
+        extra = [name for name in suggestions[1:4] if name != suggestions[0]]
+        if extra:
+            hint += f" Other options: {', '.join(extra)}."
+    raise SystemExit(
+        f"This board needs {needed} unique ArUco markers, but {dictionary_name} "
+        f"only has {available}.{hint} "
+        "Alternatively use fewer squares, or a larger --square-size."
+    )
 
 
 def _create_board(
@@ -160,9 +258,18 @@ def _create_board(
 
 
 def _render_board(board, size: tuple[int, int], margin_px: int, border_bits: int):
-    if hasattr(board, "generateImage"):
-        return board.generateImage(size, marginSize=margin_px, borderBits=border_bits)
-    return board.draw(size, marginSize=margin_px, borderBits=border_bits)
+    try:
+        if hasattr(board, "generateImage"):
+            return board.generateImage(size, marginSize=margin_px, borderBits=border_bits)
+        return board.draw(size, marginSize=margin_px, borderBits=border_bits)
+    except cv2.error as exc:
+        message = str(exc)
+        if "generateImageMarker" in message or "bytesList" in message:
+            raise SystemExit(
+                "OpenCV failed to draw a marker because the dictionary is too small "
+                "for this board. Use a larger --dictionary or fewer squares."
+            ) from exc
+        raise
 
 
 def _mm_to_px(mm: float, dpi: int) -> int:
@@ -192,13 +299,154 @@ def _to_pil_image(img):
     raise SystemExit("Unsupported image shape for PDF output.")
 
 
-def _write_png(output_path: str, img) -> None:
+def _format_board_details(
+    *,
+    squares_x: int,
+    squares_y: int,
+    square_size: float,
+    marker_proportion: float,
+    marker_size: float,
+    dictionary_name: str,
+    board_width_mm: float,
+    board_height_mm: float,
+    dpi: int,
+    margin_mm: float,
+    paper_label: str | None = None,
+    tile_label: str | None = None,
+    tile_grid: tuple[int, int] | None = None,
+    tile_orientation: str | None = None,
+) -> str:
+    parts = [
+        f"ChArUco {squares_x}x{squares_y}",
+        f"square {_fmt_mm_floor(square_size)}mm",
+        f"marker {_fmt_mm_floor(marker_size)}mm ({_fmt_prop(marker_proportion)})",
+        dictionary_name,
+        f"board {_fmt_mm_floor(board_width_mm)}x{_fmt_mm_floor(board_height_mm)}mm",
+    ]
+    if paper_label:
+        parts.append(paper_label)
+    if tile_label and tile_grid:
+        grid = f"{tile_grid[0]}x{tile_grid[1]}"
+        if tile_orientation:
+            parts.append(f"tile {tile_label} {tile_orientation} {grid}")
+        else:
+            parts.append(f"tile {tile_label} {grid}")
+    parts.append(f"{dpi}dpi")
+    parts.append(f"margin {_fmt_mm_floor(margin_mm)}mm")
+    return "  |  ".join(parts)
+
+
+def _outer_tile_details_edge(row: int, rows: int) -> str | None:
+    # Only the assembled board's outer bottom — not the joins cut away between tiles.
+    if row == rows - 1:
+        return "bottom"
+    return None
+
+
+def _annotation_font(size_px: int):
+    from PIL import ImageFont
+
+    candidates = (
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    )
+    for path in candidates:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size_px)
+    return ImageFont.load_default()
+
+
+def _draw_pdf_margin_details(
+    pdf,
+    text: str,
+    *,
+    page_w_pt: float,
+    page_h_pt: float,
+    margin_pt: float,
+    crop_mark_pt: float = 0.0,
+    edge: str = "bottom",
+) -> None:
+    # Draw in a page margin. For tiled output, callers pass an outer edge so
+    # the legend is not on a join that gets cut away between tiles.
+    if margin_pt <= 0 or not text:
+        return
+    vertical = edge in {"left", "right"}
+    span_pt = page_h_pt if vertical else page_w_pt
+    max_font = min(9.0, margin_pt * 0.5)
+    min_font = 3.5
+    inset = max(crop_mark_pt, 4.0)
+    usable = max(span_pt - 2 * inset, span_pt * 0.5)
+    font_pt = max_font
+    while font_pt > min_font and pdf.stringWidth(text, "Helvetica", font_pt) > usable:
+        font_pt -= 0.25
+    pdf.setFont("Helvetica", font_pt)
+    pdf.setFillColorRGB(DETAIL_GRAY, DETAIL_GRAY, DETAIL_GRAY)
+    text_w = pdf.stringWidth(text, "Helvetica", font_pt)
+    along = max(2.0, (span_pt - text_w) / 2.0)
+    across = max(1.0, (margin_pt - font_pt) / 2.0)
+    pdf.saveState()
+    if edge == "bottom":
+        pdf.drawString(along, across, text)
+    elif edge == "top":
+        pdf.drawString(along, page_h_pt - across - font_pt, text)
+    elif edge == "left":
+        pdf.translate(across + font_pt, along)
+        pdf.rotate(90)
+        pdf.drawString(0, 0, text)
+    elif edge == "right":
+        pdf.translate(page_w_pt - across, along)
+        pdf.rotate(90)
+        pdf.drawString(0, 0, text)
+    pdf.restoreState()
+
+
+def _draw_raster_margin_details(img, text: str, margin_px: int):
+    from PIL import ImageDraw
+
+    original_gray = img.ndim == 2
+    pil_img = _to_pil_image(img)
+    if pil_img.mode == "L":
+        pil_img = pil_img.convert("RGB")
+    draw = ImageDraw.Draw(pil_img)
+    font_px = max(8, int(round(margin_px * 0.45)))
+    max_w = max(8, pil_img.width - 16)
+    font = _annotation_font(font_px)
+    while font_px > 8:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        if bbox[2] - bbox[0] <= max_w:
+            break
+        font_px -= 1
+        font = _annotation_font(font_px)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    x = (pil_img.width - text_w) / 2.0
+    y = max(0.0, (margin_px - text_h) / 2.0 - bbox[1])
+    gray = int(round(DETAIL_GRAY * 255))
+    draw.text((x, y), text, font=font, fill=(gray, gray, gray))
+    rgb = np.array(pil_img)
+    if original_gray:
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+def _write_png(output_path: str, img, details_text: str | None = None, margin_px: int = 0) -> None:
+    if details_text and margin_px > 0:
+        img = _draw_raster_margin_details(img, details_text, margin_px)
     ok = cv2.imwrite(output_path, img)
     if not ok:
         raise SystemExit(f"Failed to write output image: {output_path}")
 
 
-def _write_pdf(output_path: str, img, width_mm: float, height_mm: float) -> None:
+def _write_pdf(
+    output_path: str,
+    img,
+    width_mm: float,
+    height_mm: float,
+    details_text: str | None = None,
+    margin_mm: float = 0.0,
+) -> None:
     try:
         from reportlab.lib.utils import ImageReader
         from reportlab.pdfgen import canvas
@@ -220,19 +468,51 @@ def _write_pdf(output_path: str, img, width_mm: float, height_mm: float) -> None
         preserveAspectRatio=False,
         mask="auto",
     )
+    if details_text and margin_mm > 0:
+        _draw_pdf_margin_details(
+            pdf,
+            details_text,
+            page_w_pt=width_pt,
+            page_h_pt=height_pt,
+            margin_pt=_mm_to_points(margin_mm),
+            edge="bottom",
+        )
     pdf.showPage()
     pdf.save()
 
 
-def _tile_grid_counts(
+def _cover_count(main_mm: float, tile_mm: float, slack_mm: float = 2.0) -> int:
+    # ISO sizes are rounded to millimetres (2*A3 height is 840 mm vs A1 841 mm).
+    if tile_mm <= 0:
+        raise SystemExit("tile size must be > 0.")
+    count = max(1, math.ceil(main_mm / tile_mm - 1e-9))
+    while count > 1 and (count - 1) * tile_mm + slack_mm >= main_mm:
+        count -= 1
+    return count
+
+
+def _choose_tile_layout(
     main_width_mm: float,
     main_height_mm: float,
     tile_width_mm: float,
     tile_height_mm: float,
-) -> tuple[int, int]:
-    cols = max(1, int(round(main_width_mm / tile_width_mm)))
-    rows = max(1, int(round(main_height_mm / tile_height_mm)))
-    return cols, rows
+) -> tuple[float, float, int, int]:
+    # Prefer the orientation that covers the main paper with the fewest pages.
+    candidates: list[tuple[int, int, int, int, float, float]] = []
+    seen: set[tuple[float, float]] = set()
+    for index, (orient_w, orient_h) in enumerate(
+        ((tile_width_mm, tile_height_mm), (tile_height_mm, tile_width_mm))
+    ):
+        key = (orient_w, orient_h)
+        if key in seen:
+            continue
+        seen.add(key)
+        cols = _cover_count(main_width_mm, orient_w)
+        rows = _cover_count(main_height_mm, orient_h)
+        candidates.append((cols * rows, index, cols, rows, orient_w, orient_h))
+    candidates.sort()
+    _, _, cols, rows, orient_w, orient_h = candidates[0]
+    return orient_w, orient_h, cols, rows
 
 
 def _draw_crop_marks(
@@ -362,7 +642,7 @@ def _draw_tile_label(
     y = trim_y1 + pad + font_pt
     if x < 0 or y > page_h_pt:
         return
-    pdf.setFillColorRGB(0, 0, 0)
+    pdf.setFillColorRGB(DETAIL_GRAY, DETAIL_GRAY, DETAIL_GRAY)
     pdf.drawString(x, y - font_pt, label)
 
 
@@ -378,6 +658,7 @@ def _write_tiled_pdf(
     dpi: int,
     cols: int,
     rows: int,
+    details_text: str | None = None,
 ) -> None:
     try:
         from reportlab.lib.utils import ImageReader
@@ -457,6 +738,17 @@ def _write_tiled_pdf(
                 stroke_pt=stroke_pt,
                 font_pt=label_pt,
             )
+            details_edge = _outer_tile_details_edge(row, rows)
+            if details_text and tile_margin_mm > 0 and details_edge:
+                _draw_pdf_margin_details(
+                    pdf,
+                    f"{details_text}  |  r{row}c{col}",
+                    page_w_pt=tile_w_pt,
+                    page_h_pt=tile_h_pt,
+                    margin_pt=_mm_to_points(tile_margin_mm),
+                    crop_mark_pt=mark_len_pt,
+                    edge=details_edge,
+                )
             pdf.showPage()
     pdf.save()
 
@@ -553,6 +845,21 @@ def _paper_size_mm(name: str) -> tuple[float, float]:
     return PAPER_SIZES_MM[key]
 
 
+def _parse_size_mm(value: str) -> tuple[float, float]:
+    token = value.strip().lower().replace("mm", "").replace("×", "x")
+    parts = [part.strip() for part in token.split("x")]
+    if len(parts) != 2:
+        raise SystemExit("size must be WIDTHxHEIGHT in millimetres (e.g. 500x700).")
+    try:
+        width_mm = float(parts[0])
+        height_mm = float(parts[1])
+    except ValueError:
+        raise SystemExit("size must be WIDTHxHEIGHT in millimetres (e.g. 500x700).")
+    if width_mm <= 0 or height_mm <= 0:
+        raise SystemExit("size width and height must be > 0.")
+    return width_mm, height_mm
+
+
 def _fmt_mm(mm: float) -> str:
     if abs(mm - round(mm)) < 1e-6:
         return str(int(round(mm)))
@@ -591,6 +898,7 @@ def _auto_output_name(
     output_format: str,
     tile_label: str | None,
     tile_grid: tuple[int, int] | None,
+    dictionary_name: str,
 ) -> str:
     parts: list[str] = ["charuco"]
     if paper_label:
@@ -601,6 +909,7 @@ def _auto_output_name(
     if (
         square_size != DEFAULT_SQUARE_SIZE_MM
         or "--square-size" in provided_flags
+        or "--target-square-size" in provided_flags
         or paper_label is not None
     ):
         extras.append(f"{_sanitize_token(_fmt_mm(square_size))}mm")
@@ -617,8 +926,8 @@ def _auto_output_name(
         extras.append(f"tile{tile_label}")
         if tile_grid:
             extras.append(f"{tile_grid[0]}x{tile_grid[1]}tiles")
-    if args.dictionary != DEFAULT_DICTIONARY or "--dictionary" in provided_flags:
-        extras.append(args.dictionary.lower())
+    if dictionary_name != PREFERRED_DICTIONARY or "--dictionary" in provided_flags:
+        extras.append(dictionary_name.lower())
 
     parts.extend(extras)
     filename = "_".join(parts) + f".{output_format}"
@@ -632,20 +941,36 @@ def main() -> int:
     for token in argv:
         if token.startswith("--"):
             provided_flags.add(token.split("=", 1)[0])
-    paper_provided = "--paper" in argv
-    tile_paper_provided = "--tile-paper" in argv
-    squares_x_provided = "--squares-x" in argv
-    squares_y_provided = "--squares-y" in argv
+    paper_provided = "--paper" in provided_flags
+    size_provided = "--size" in provided_flags
+    tile_paper_provided = "--tile-paper" in provided_flags
+    squares_x_provided = "--squares-x" in provided_flags
+    squares_y_provided = "--squares-y" in provided_flags
     squares_provided = squares_x_provided or squares_y_provided
+    square_size_provided = "--square-size" in provided_flags
+    target_size_provided = "--target-square-size" in provided_flags
+    board_bounds_provided = paper_provided or size_provided
 
     if squares_x_provided ^ squares_y_provided:
         raise SystemExit("Provide both --squares-x and --squares-y together.")
-    if tile_paper_provided and not paper_provided:
-        raise SystemExit("--tile-paper requires --paper to set the main size.")
+    if paper_provided and size_provided:
+        raise SystemExit("Use either --paper or --size, not both.")
+    if tile_paper_provided and not board_bounds_provided:
+        raise SystemExit("--tile-paper requires --paper or --size to set the main size.")
+    if square_size_provided and target_size_provided:
+        raise SystemExit("Use either --square-size (exact) or --target-square-size (fill), not both.")
+    if target_size_provided and squares_provided:
+        raise SystemExit("--target-square-size cannot be combined with --squares-x/--squares-y.")
+    if target_size_provided and not board_bounds_provided:
+        raise SystemExit("--target-square-size requires --paper or --size.")
 
     if not (0.0 < args.marker_proportion < 1.0):
         raise SystemExit("marker-proportion must be in the 0-1 range (exclusive).")
-    if args.square_size <= 0:
+    if square_size_provided and args.square_size <= 0:
+        raise SystemExit("square-size must be > 0.")
+    if target_size_provided and args.target_square_size <= 0:
+        raise SystemExit("target-square-size must be > 0.")
+    if not square_size_provided and not target_size_provided and args.square_size <= 0:
         raise SystemExit("square-size must be > 0.")
     if args.margin < 0:
         raise SystemExit("margin must be >= 0.")
@@ -665,14 +990,22 @@ def main() -> int:
     tile_height_mm = None
     tile_printable_w = None
     tile_printable_h = None
+    fill_to_paper = False
 
-    if paper_provided:
-        paper_width_mm, paper_height_mm = _paper_size_mm(args.paper or "A4")
-        paper_label = (args.paper or "A4").upper()
+    if board_bounds_provided:
+        if paper_provided:
+            paper_width_mm, paper_height_mm = _paper_size_mm(args.paper or "A4")
+            paper_label = (args.paper or "A4").upper()
+        else:
+            paper_width_mm, paper_height_mm = _parse_size_mm(args.size)
+            paper_label = (
+                f"{_sanitize_token(_fmt_mm(paper_width_mm))}x"
+                f"{_sanitize_token(_fmt_mm(paper_height_mm))}mm"
+            )
         if tile_paper_provided:
             tile_width_mm, tile_height_mm = _paper_size_mm(args.tile_paper)
             tile_label = args.tile_paper.upper()
-            tile_cols, tile_rows = _tile_grid_counts(
+            tile_width_mm, tile_height_mm, tile_cols, tile_rows = _choose_tile_layout(
                 paper_width_mm, paper_height_mm, tile_width_mm, tile_height_mm
             )
             tile_printable_w = tile_width_mm - 2 * args.margin
@@ -692,15 +1025,34 @@ def main() -> int:
             squares_y = args.squares_y
             if squares_x < 2 or squares_y < 2:
                 raise SystemExit("squares-x and squares-y must be >= 2.")
+            if square_size_provided:
+                square_size = args.square_size
+                if (
+                    squares_x * square_size > available_w + 1e-6
+                    or squares_y * square_size > available_h + 1e-6
+                ):
+                    raise SystemExit(
+                        "Exact --square-size with these square counts does not fit "
+                        "the printable area."
+                    )
+            else:
+                square_size = min(available_w / squares_x, available_h / squares_y)
+                fill_to_paper = True
+        elif target_size_provided:
+            squares_x = int(round(available_w / args.target_square_size))
+            squares_y = int(round(available_h / args.target_square_size))
+            if squares_x < 2 or squares_y < 2:
+                raise SystemExit(
+                    "paper size is too small for the requested target-square-size."
+                )
             square_size = min(available_w / squares_x, available_h / squares_y)
+            fill_to_paper = True
         else:
-            squares_x = int(round(available_w / args.square_size))
-            squares_y = int(round(available_h / args.square_size))
+            square_size = args.square_size
+            squares_x = int(math.floor(available_w / square_size + 1e-9))
+            squares_y = int(math.floor(available_h / square_size + 1e-9))
             if squares_x < 2 or squares_y < 2:
                 raise SystemExit("paper size is too small for the requested square-size.")
-            actual_square_w = available_w / squares_x
-            actual_square_h = available_h / squares_y
-            square_size = min(actual_square_w, actual_square_h)
 
         if tile_paper_provided:
             output_width_mm = available_w
@@ -722,7 +1074,13 @@ def main() -> int:
     board_width_mm = squares_x * square_size
     board_height_mm = squares_y * square_size
 
-    dictionary = _get_dictionary(args.dictionary)
+    dictionary_auto = args.dictionary.lower() == DEFAULT_DICTIONARY
+    if dictionary_auto:
+        needed_estimate = (squares_x * squares_y) // 2
+        dictionary_name = _select_dictionary(needed_estimate)
+    else:
+        dictionary_name = args.dictionary
+    dictionary = _get_dictionary(dictionary_name)
     board = _create_board(
         squares_x,
         squares_y,
@@ -730,6 +1088,19 @@ def main() -> int:
         marker_size,
         dictionary,
     )
+    needed_markers = _board_required_marker_count(board)
+    if dictionary_auto and needed_markers > _dictionary_size(dictionary):
+        dictionary_name = _select_dictionary(needed_markers)
+        dictionary = _get_dictionary(dictionary_name)
+        board = _create_board(
+            squares_x,
+            squares_y,
+            square_size,
+            marker_size,
+            dictionary,
+        )
+    elif not dictionary_auto:
+        _ensure_dictionary_covers_board(dictionary, board, dictionary_name)
     output_path = args.output
     output_format = args.format.lower()
     if output_path != DEFAULT_OUTPUT:
@@ -752,8 +1123,32 @@ def main() -> int:
             output_format=output_format,
             tile_label=tile_label,
             tile_grid=(tile_cols, tile_rows) if tile_paper_provided else None,
+            dictionary_name=dictionary_name,
         )
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    details_text = None
+    if args.margin > 0:
+        tile_orientation = None
+        if tile_paper_provided:
+            tile_orientation = (
+                "landscape" if tile_width_mm > tile_height_mm else "portrait"
+            )
+        details_text = _format_board_details(
+            squares_x=squares_x,
+            squares_y=squares_y,
+            square_size=square_size,
+            marker_proportion=args.marker_proportion,
+            marker_size=marker_size,
+            dictionary_name=dictionary_name,
+            board_width_mm=board_width_mm,
+            board_height_mm=board_height_mm,
+            dpi=args.dpi,
+            margin_mm=args.margin,
+            paper_label=paper_label,
+            tile_label=tile_label,
+            tile_grid=(tile_cols, tile_rows) if tile_paper_provided else None,
+            tile_orientation=tile_orientation,
+        )
     minimap_path = None
     if tile_paper_provided:
         if output_format != "pdf":
@@ -778,6 +1173,7 @@ def main() -> int:
             dpi=args.dpi,
             cols=tile_cols,
             rows=tile_rows,
+            details_text=details_text,
         )
         minimap_path = _minimap_path(output_path)
         _write_minimap(
@@ -794,11 +1190,25 @@ def main() -> int:
         width_px = _mm_to_px(output_width_mm, args.dpi)
         height_px = _mm_to_px(output_height_mm, args.dpi)
         margin_px = _mm_to_px(args.margin, args.dpi)
-        img = _render_board(board, (width_px, height_px), margin_px, border_bits=1)
+        if board_bounds_provided and not fill_to_paper:
+            board_w_px = _mm_to_px(board_width_mm, args.dpi)
+            board_h_px = _mm_to_px(board_height_mm, args.dpi)
+            board_img = _render_board(board, (board_w_px, board_h_px), 0, border_bits=1)
+            img = np.full((height_px, width_px), 255, dtype=board_img.dtype)
+            _center_paste(img, board_img)
+        else:
+            img = _render_board(board, (width_px, height_px), margin_px, border_bits=1)
         if output_format == "png":
-            _write_png(output_path, img)
+            _write_png(output_path, img, details_text=details_text, margin_px=margin_px)
         elif output_format == "pdf":
-            _write_pdf(output_path, img, output_width_mm, output_height_mm)
+            _write_pdf(
+                output_path,
+                img,
+                output_width_mm,
+                output_height_mm,
+                details_text=details_text,
+                margin_mm=args.margin,
+            )
         else:
             raise SystemExit(f"Unknown output format: {output_format}")
 
@@ -807,25 +1217,28 @@ def main() -> int:
     print(f"  squares: {squares_x} x {squares_y}")
     print(f"  square size (mm): {_fmt_mm_floor(square_size)}")
     if (
-        paper_provided
-        and "--square-size" in provided_flags
-        and abs(square_size - args.square_size) > 0.01
+        target_size_provided
+        and abs(square_size - args.target_square_size) > 0.01
     ):
-        print(f"  requested square size (mm): {_fmt_mm_floor(args.square_size)}")
+        print(f"  requested square size (mm): {_fmt_mm_floor(args.target_square_size)}")
     print(f"  marker proportion: {args.marker_proportion}")
     print(f"  marker size (mm): {_fmt_mm_floor(marker_size)}")
-    print(f"  dictionary: {args.dictionary}")
+    print(f"  dictionary: {dictionary_name}" + (" (auto)" if dictionary_auto else ""))
     print(
         "  board size (mm):"
         f" {_fmt_mm_floor(board_width_mm)} x {_fmt_mm_floor(board_height_mm)}"
     )
-    if paper_provided:
+    if board_bounds_provided:
+        size_kind = "paper" if paper_provided else "size"
         if tile_paper_provided:
-            print(f"  paper: {paper_label} (main)")
+            print(f"  {size_kind}: {paper_label} (main)")
         else:
-            print(f"  paper: {paper_label}")
+            print(f"  {size_kind}: {paper_label}")
     if tile_paper_provided:
-        print(f"  tile paper: {tile_label}")
+        tile_orientation = (
+            "landscape" if tile_width_mm > tile_height_mm else "portrait"
+        )
+        print(f"  tile paper: {tile_label} ({tile_orientation})")
         print(f"  tiles: {tile_cols} x {tile_rows}")
         print(f"  tile margin (mm): {_fmt_mm_floor(args.margin)}")
         print(f"  tile bleed (mm): {_fmt_mm_floor(args.tile_bleed)}")
