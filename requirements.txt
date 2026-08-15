@@ -2,5 +2,7 @@ opencv-contrib-python>=4.7
 numpy>=1.23
 Pillow>=10.0
 reportlab>=3.6
-# ps3eye_tools depends on a locally-built `ps3eye` module from
-# https://github.com/soswow/PS3Eye-library (see `ps3eye_tools/README.md`).
+matplotlib>=3.8.0
+pyyaml>=6.0.0
+# ps3eye-tools / live-calibration depend on a locally-built `ps3eye` module from
+# https://github.com/soswow/PS3Eye-library (see `ps3eye-tools/README.md`).

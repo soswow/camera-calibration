@@ -1,0 +1,2 @@
+[console_scripts]
+camera-calibration = camera_calibration.cli.main:main

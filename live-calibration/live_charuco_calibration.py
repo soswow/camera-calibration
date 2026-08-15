@@ -361,6 +361,15 @@ def _build_calibration_payload(
         "reprojection_error": reproj_error,
         "camera_matrix": camera_matrix.tolist() if camera_matrix is not None else None,
         "dist_coeffs": dist_coeffs.tolist() if dist_coeffs is not None else None,
+        "distortion_coefficients": (
+            dist_coeffs.ravel().tolist() if dist_coeffs is not None else None
+        ),
+        "rms_reprojection_error": reproj_error,
+        "board_type": "charuco",
+        "pattern_size": [SQUARES_X, SQUARES_Y],
+        "square_size": SQUARE_SIZE_MM,
+        "dictionary": DICTIONARY,
+        "marker_proportion": MARKER_PROPORTION,
         "per_view_errors": per_view_errors,
         "acceptance": {
             "min_markers": MIN_MARKERS,

@@ -1,3 +1,16 @@
+Metadata-Version: 2.4
+Name: camera-calibration
+Version: 0.1.0
+Summary: ChArUco and checkerboard camera calibration helpers
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: opencv-contrib-python>=4.7
+Requires-Dist: numpy>=1.23
+Requires-Dist: Pillow>=10.0
+Requires-Dist: reportlab>=3.6
+Requires-Dist: matplotlib>=3.8.0
+Requires-Dist: pyyaml>=6.0.0
+
 # Camera Calibration
 
 Tools for **ChArUco** and **checkerboard** camera calibration: print a board, capture photos, estimate intrinsics, export JSON / ROS YAML, undistort, and visualize distortion. PS3 Eye live capture and preview helpers are included too.

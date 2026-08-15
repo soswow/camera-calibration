@@ -1,10 +1,13 @@
 .DS_Store
+.venv/
 /refs
 output/*.png
+input/
 *.pdf
 output/
 *.pyc
-__pycache__/*
+__pycache__/
+*.py[cod]
 calibration-frames-undistorted/
 calibration.json
 frame_scores.json

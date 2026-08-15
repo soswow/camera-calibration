@@ -42,8 +42,9 @@ PAPER_SIZES_MM = {
 }
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        prog="camera-calibration generate-charuco",
         description="Generate a ChArUco board image (OpenCV aruco).",
     )
     parser.add_argument(
@@ -158,7 +159,7 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_FORMAT,
         help=f"Output format. Default: {DEFAULT_FORMAT}.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _dictionary_names() -> list[str]:
@@ -1023,11 +1024,11 @@ def _auto_output_name(
     return os.path.join(DEFAULT_OUTPUT_DIR, filename)
 
 
-def main() -> int:
-    args = _parse_args()
-    argv = sys.argv[1:]
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    argv_tokens = list(argv) if argv is not None else sys.argv[1:]
     provided_flags = set()
-    for token in argv:
+    for token in argv_tokens:
         if token.startswith("--"):
             provided_flags.add(token.split("=", 1)[0])
     paper_provided = "--paper" in provided_flags
@@ -1374,4 +1375,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

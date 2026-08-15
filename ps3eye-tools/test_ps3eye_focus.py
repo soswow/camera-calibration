@@ -20,9 +20,9 @@ AUTO_EXPOSURE = False
 GAIN = 40
 EXPOSURE = 60
 
-# Checkerboard settings (internal corners)
-CHECKERBOARD_CORNERS_X = 6
-CHECKERBOARD_CORNERS_Y = 9
+# Checkerboard settings (count squares; OpenCV uses inner corners = squares - 1)
+CHECKERBOARD_SQUARES_X = 7
+CHECKERBOARD_SQUARES_Y = 10
 
 # Rolling average
 SHARPNESS_WINDOW = 120
@@ -101,7 +101,7 @@ def main() -> int:
                 color = img
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            pattern_size = (CHECKERBOARD_CORNERS_X, CHECKERBOARD_CORNERS_Y)
+            pattern_size = (CHECKERBOARD_SQUARES_X - 1, CHECKERBOARD_SQUARES_Y - 1)
             found = False
             corners = None
 
