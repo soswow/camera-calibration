@@ -276,6 +276,17 @@ def _mm_to_px(mm: float, dpi: int) -> int:
     return int(round(mm / 25.4 * dpi))
 
 
+def _board_pixel_size(
+    squares_x: int,
+    squares_y: int,
+    square_size_mm: float,
+    dpi: int,
+) -> tuple[int, int]:
+    # Per-square rounding so generateImage is never 1px short of the grid.
+    square_px = max(1, _mm_to_px(square_size_mm, dpi))
+    return squares_x * square_px, squares_y * square_px
+
+
 def _mm_to_points(mm: float) -> float:
     return mm / 25.4 * 72.0
 
@@ -336,9 +347,9 @@ def _format_board_details(
     return "  |  ".join(parts)
 
 
-def _outer_tile_details_edge(row: int, rows: int) -> str | None:
-    # Only the assembled board's outer bottom — not the joins cut away between tiles.
-    if row == rows - 1:
+def _outer_tile_details_edge(col: int, row: int, rows: int) -> str | None:
+    # One legend, on the assembled board's bottom-left tile.
+    if row == rows - 1 and col == 0:
         return "bottom"
     return None
 
@@ -364,41 +375,29 @@ def _draw_pdf_margin_details(
     page_w_pt: float,
     page_h_pt: float,
     margin_pt: float,
-    crop_mark_pt: float = 0.0,
-    edge: str = "bottom",
+    board_x0_pt: float | None = None,
+    board_x1_pt: float | None = None,
+    board_y0_pt: float | None = None,
 ) -> None:
-    # Draw in a page margin. For tiled output, callers pass an outer edge so
-    # the legend is not on a join that gets cut away between tiles.
+    # Sit the legend just below the board, left-aligned to the board edge.
     if margin_pt <= 0 or not text:
         return
-    vertical = edge in {"left", "right"}
-    span_pt = page_h_pt if vertical else page_w_pt
+    x0 = board_x0_pt if board_x0_pt is not None else 0.0
+    x1 = board_x1_pt if board_x1_pt is not None else page_w_pt
+    board_bottom = board_y0_pt if board_y0_pt is not None else margin_pt
+    usable = max(x1 - x0, page_w_pt * 0.5)
     max_font = min(9.0, margin_pt * 0.5)
     min_font = 3.5
-    inset = max(crop_mark_pt, 4.0)
-    usable = max(span_pt - 2 * inset, span_pt * 0.5)
     font_pt = max_font
     while font_pt > min_font and pdf.stringWidth(text, "Helvetica", font_pt) > usable:
         font_pt -= 0.25
     pdf.setFont("Helvetica", font_pt)
     pdf.setFillColorRGB(DETAIL_GRAY, DETAIL_GRAY, DETAIL_GRAY)
-    text_w = pdf.stringWidth(text, "Helvetica", font_pt)
-    along = max(2.0, (span_pt - text_w) / 2.0)
-    across = max(1.0, (margin_pt - font_pt) / 2.0)
-    pdf.saveState()
-    if edge == "bottom":
-        pdf.drawString(along, across, text)
-    elif edge == "top":
-        pdf.drawString(along, page_h_pt - across - font_pt, text)
-    elif edge == "left":
-        pdf.translate(across + font_pt, along)
-        pdf.rotate(90)
-        pdf.drawString(0, 0, text)
-    elif edge == "right":
-        pdf.translate(page_w_pt - across, along)
-        pdf.rotate(90)
-        pdf.drawString(0, 0, text)
-    pdf.restoreState()
+    gap = max(1.0, font_pt * 0.25)
+    y = board_bottom - gap - font_pt
+    if y < 1.0:
+        y = 1.0
+    pdf.drawString(x0, y, text)
 
 
 def _draw_raster_margin_details(img, text: str, margin_px: int):
@@ -475,20 +474,73 @@ def _write_pdf(
             page_w_pt=width_pt,
             page_h_pt=height_pt,
             margin_pt=_mm_to_points(margin_mm),
-            edge="bottom",
+            board_x0_pt=_mm_to_points(margin_mm),
+            board_x1_pt=width_pt - _mm_to_points(margin_mm),
+            board_y0_pt=_mm_to_points(margin_mm),
         )
     pdf.showPage()
     pdf.save()
 
 
-def _cover_count(main_mm: float, tile_mm: float, slack_mm: float = 2.0) -> int:
-    # ISO sizes are rounded to millimetres (2*A3 height is 840 mm vs A1 841 mm).
-    if tile_mm <= 0:
-        raise SystemExit("tile size must be > 0.")
-    count = max(1, math.ceil(main_mm / tile_mm - 1e-9))
-    while count > 1 and (count - 1) * tile_mm + slack_mm >= main_mm:
-        count -= 1
-    return count
+def _px_to_mm(px: int, dpi: int) -> float:
+    return px * 25.4 / dpi
+
+
+def _square_snapped_spans_mm(
+    total_mm: float,
+    printable_mm: float,
+    square_mm: float,
+    origin_mm: float = 0.0,
+) -> list[float]:
+    # Prefer cuts on square borders so a square that does not fully fit moves
+    # to the next tile instead of being sliced. Slice through a square only if
+    # it is larger than the printable span.
+    if total_mm <= 0 or printable_mm <= 0:
+        return [max(total_mm, 0.0)]
+    eps = 1e-6
+    borders = [0.0, total_mm]
+    if square_mm > 0:
+        index = 0
+        while True:
+            border = origin_mm + index * square_mm
+            if border > total_mm + eps:
+                break
+            if border > eps:
+                borders.append(min(border, total_mm))
+            index += 1
+            if index > 10000:
+                break
+    unique_borders = sorted({round(border, 6) for border in borders})
+
+    spans: list[float] = []
+    position = 0.0
+    while position < total_mm - eps:
+        limit = min(total_mm, position + printable_mm)
+        reachable = [
+            border
+            for border in unique_borders
+            if border > position + eps and border <= limit + eps
+        ]
+        if reachable:
+            next_position = max(reachable)
+        else:
+            next_position = limit
+        if next_position <= position + eps:
+            next_position = min(total_mm, position + printable_mm)
+        spans.append(next_position - position)
+        position = next_position
+    return spans or [total_mm]
+
+
+def _spans_mm_to_px(spans_mm: list[float], total_px: int, dpi: int) -> list[int]:
+    if not spans_mm:
+        return [total_px] if total_px > 0 else []
+    spans_px = [max(0, _mm_to_px(span, dpi)) for span in spans_mm]
+    spans_px[-1] += total_px - sum(spans_px)
+    if spans_px[-1] <= 0 and len(spans_px) > 1:
+        spans_px[-2] += spans_px[-1]
+        spans_px.pop()
+    return [span for span in spans_px if span > 0]
 
 
 def _choose_tile_layout(
@@ -496,9 +548,13 @@ def _choose_tile_layout(
     main_height_mm: float,
     tile_width_mm: float,
     tile_height_mm: float,
-) -> tuple[float, float, int, int]:
-    # Prefer the orientation that covers the main paper with the fewest pages.
-    candidates: list[tuple[int, int, int, int, float, float]] = []
+    margin_mm: float,
+    square_size_mm: float,
+    origin_x_mm: float = 0.0,
+    origin_y_mm: float = 0.0,
+) -> tuple[float, float, list[float], list[float]]:
+    # Cover the board with printable tile area, snapping joins to square borders.
+    candidates: list[tuple[int, int, float, float, list[float], list[float]]] = []
     seen: set[tuple[float, float]] = set()
     for index, (orient_w, orient_h) in enumerate(
         ((tile_width_mm, tile_height_mm), (tile_height_mm, tile_width_mm))
@@ -507,12 +563,24 @@ def _choose_tile_layout(
         if key in seen:
             continue
         seen.add(key)
-        cols = _cover_count(main_width_mm, orient_w)
-        rows = _cover_count(main_height_mm, orient_h)
-        candidates.append((cols * rows, index, cols, rows, orient_w, orient_h))
-    candidates.sort()
-    _, _, cols, rows, orient_w, orient_h = candidates[0]
-    return orient_w, orient_h, cols, rows
+        printable_w = orient_w - 2 * margin_mm
+        printable_h = orient_h - 2 * margin_mm
+        if printable_w <= 0 or printable_h <= 0:
+            continue
+        x_spans = _square_snapped_spans_mm(
+            main_width_mm, printable_w, square_size_mm, origin_x_mm
+        )
+        y_spans = _square_snapped_spans_mm(
+            main_height_mm, printable_h, square_size_mm, origin_y_mm
+        )
+        candidates.append(
+            (len(x_spans) * len(y_spans), index, orient_w, orient_h, x_spans, y_spans)
+        )
+    if not candidates:
+        raise SystemExit("margin is too large for the selected tile paper size.")
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    _, _, orient_w, orient_h, x_spans, y_spans = candidates[0]
+    return orient_w, orient_h, x_spans, y_spans
 
 
 def _draw_crop_marks(
@@ -658,6 +726,8 @@ def _write_tiled_pdf(
     dpi: int,
     cols: int,
     rows: int,
+    col_spans_px: list[int],
+    row_spans_px: list[int],
     details_text: str | None = None,
 ) -> None:
     try:
@@ -668,39 +738,41 @@ def _write_tiled_pdf(
             "PDF output requires reportlab. Install with: pip install reportlab"
         ) from exc
 
-    tile_content_w_mm = tile_width_mm - 2 * tile_margin_mm
-    tile_content_h_mm = tile_height_mm - 2 * tile_margin_mm
-    tile_content_w_px = _mm_to_px(tile_content_w_mm, dpi)
-    tile_content_h_px = _mm_to_px(tile_content_h_mm, dpi)
     bleed_px = _mm_to_px(tile_bleed_mm, dpi)
-    tile_img_w_px = tile_content_w_px + 2 * bleed_px
-    tile_img_h_px = tile_content_h_px + 2 * bleed_px
 
     tile_w_pt = _mm_to_points(tile_width_mm)
     tile_h_pt = _mm_to_points(tile_height_mm)
-    draw_w_pt = _mm_to_points(tile_content_w_mm + 2 * tile_bleed_mm)
-    draw_h_pt = _mm_to_points(tile_content_h_mm + 2 * tile_bleed_mm)
-    draw_x_pt = _mm_to_points(tile_margin_mm - tile_bleed_mm)
-    draw_y_pt = _mm_to_points(tile_margin_mm - tile_bleed_mm)
-    trim_x0 = _mm_to_points(tile_margin_mm)
-    trim_y0 = _mm_to_points(tile_margin_mm)
-    trim_x1 = _mm_to_points(tile_margin_mm + tile_content_w_mm)
-    trim_y1 = _mm_to_points(tile_margin_mm + tile_content_h_mm)
+    margin_pt = _mm_to_points(tile_margin_mm)
+    bleed_pt = _mm_to_points(tile_bleed_mm)
     mark_len_pt = _mm_to_points(crop_mark_mm)
     stroke_pt = _mm_to_points(DEFAULT_CROP_STROKE_MM)
     label_pt = DEFAULT_TILE_LABEL_PT
 
     canvas_w_px = canvas_img.shape[1]
     canvas_h_px = canvas_img.shape[0]
+    x_offsets = [0]
+    y_offsets = [0]
+    for span in col_spans_px:
+        x_offsets.append(x_offsets[-1] + span)
+    for span in row_spans_px:
+        y_offsets.append(y_offsets[-1] + span)
 
     pdf = pdf_canvas.Canvas(output_path, pagesize=(tile_w_pt, tile_h_pt))
     for row in range(rows):
         for col in range(cols):
-            x0_px = col * tile_content_w_px
-            y0_px = row * tile_content_h_px
-            x1_px = x0_px + tile_content_w_px
-            y1_px = y0_px + tile_content_h_px
+            x0_px = x_offsets[col]
+            y0_px = y_offsets[row]
+            slice_w_px = col_spans_px[col]
+            slice_h_px = row_spans_px[row]
+            if slice_w_px <= 0 or slice_h_px <= 0:
+                continue
+            x1_px = x0_px + slice_w_px
+            y1_px = y0_px + slice_h_px
+            slice_w_mm = _px_to_mm(slice_w_px, dpi)
+            slice_h_mm = _px_to_mm(slice_h_px, dpi)
 
+            tile_img_w_px = slice_w_px + 2 * bleed_px
+            tile_img_h_px = slice_h_px + 2 * bleed_px
             tile_img = np.full(
                 (tile_img_h_px, tile_img_w_px),
                 255,
@@ -717,6 +789,16 @@ def _write_tiled_pdf(
             dst_y1 = dst_y0 + (src_y1 - src_y0)
 
             tile_img[dst_y0:dst_y1, dst_x0:dst_x1] = canvas_img[src_y0:src_y1, src_x0:src_x1]
+
+            # Content is top-left aligned so last-row/column remainders stay on the join edges.
+            trim_x0 = margin_pt
+            trim_y1 = tile_h_pt - margin_pt
+            trim_x1 = trim_x0 + _mm_to_points(slice_w_mm)
+            trim_y0 = trim_y1 - _mm_to_points(slice_h_mm)
+            draw_w_pt = _mm_to_points(slice_w_mm + 2 * tile_bleed_mm)
+            draw_h_pt = _mm_to_points(slice_h_mm + 2 * tile_bleed_mm)
+            draw_x_pt = trim_x0 - bleed_pt
+            draw_y_pt = trim_y0 - bleed_pt
 
             pil_tile = _to_pil_image(tile_img)
             pdf.drawImage(
@@ -738,16 +820,17 @@ def _write_tiled_pdf(
                 stroke_pt=stroke_pt,
                 font_pt=label_pt,
             )
-            details_edge = _outer_tile_details_edge(row, rows)
+            details_edge = _outer_tile_details_edge(col, row, rows)
             if details_text and tile_margin_mm > 0 and details_edge:
                 _draw_pdf_margin_details(
                     pdf,
-                    f"{details_text}  |  r{row}c{col}",
+                    details_text,
                     page_w_pt=tile_w_pt,
                     page_h_pt=tile_h_pt,
-                    margin_pt=_mm_to_points(tile_margin_mm),
-                    crop_mark_pt=mark_len_pt,
-                    edge=details_edge,
+                    margin_pt=margin_pt,
+                    board_x0_pt=trim_x0,
+                    board_x1_pt=trim_x1,
+                    board_y0_pt=trim_y0,
                 )
             pdf.showPage()
     pdf.save()
@@ -757,10 +840,8 @@ def _write_minimap(
     output_path: str,
     canvas_img,
     *,
-    tile_content_w_px: int,
-    tile_content_h_px: int,
-    cols: int,
-    rows: int,
+    col_spans_px: list[int],
+    row_spans_px: list[int],
 ) -> None:
     canvas_h_px, canvas_w_px = canvas_img.shape[:2]
     max_dim = max(canvas_w_px, canvas_h_px)
@@ -777,17 +858,25 @@ def _write_minimap(
     overlay = minimap.copy()
     thickness = 1
     line_color = (0, 255, 0)
-    tile_w_scaled = tile_content_w_px * scale
-    tile_h_scaled = tile_content_h_px * scale
-    font_scale = max(0.3, min(0.8, min(tile_w_scaled, tile_h_scaled) / 400.0))
+    cols = len(col_spans_px)
+    rows = len(row_spans_px)
+    min_span = min(col_spans_px + row_spans_px) if col_spans_px and row_spans_px else 1
+    font_scale = max(0.3, min(0.8, min_span * scale / 400.0))
     font = cv2.FONT_HERSHEY_SIMPLEX
 
-    for c in range(cols + 1):
-        x = int(round(c * tile_content_w_px * scale))
+    x_offsets = [0]
+    y_offsets = [0]
+    for span in col_spans_px:
+        x_offsets.append(x_offsets[-1] + span)
+    for span in row_spans_px:
+        y_offsets.append(y_offsets[-1] + span)
+
+    for x_px in x_offsets:
+        x = int(round(x_px * scale))
         x = min(max(x, 0), new_w - 1)
         cv2.line(overlay, (x, 0), (x, new_h - 1), line_color, thickness)
-    for r in range(rows + 1):
-        y = int(round(r * tile_content_h_px * scale))
+    for y_px in y_offsets:
+        y = int(round(y_px * scale))
         y = min(max(y, 0), new_h - 1)
         cv2.line(overlay, (0, y), (new_w - 1, y), line_color, thickness)
 
@@ -796,8 +885,8 @@ def _write_minimap(
         for c in range(cols):
             label = f"r{r}c{c}"
             text_size, baseline = cv2.getTextSize(label, font, font_scale, 1)
-            x = int(round(c * tile_content_w_px * scale)) + 3
-            y = int(round(r * tile_content_h_px * scale)) + 3 + text_size[1]
+            x = int(round(x_offsets[c] * scale)) + 3
+            y = int(round(y_offsets[r] * scale)) + 3 + text_size[1]
             if x + text_size[0] >= new_w or y + baseline >= new_h:
                 continue
             cv2.putText(
@@ -1005,20 +1094,20 @@ def main() -> int:
         if tile_paper_provided:
             tile_width_mm, tile_height_mm = _paper_size_mm(args.tile_paper)
             tile_label = args.tile_paper.upper()
-            tile_width_mm, tile_height_mm, tile_cols, tile_rows = _choose_tile_layout(
-                paper_width_mm, paper_height_mm, tile_width_mm, tile_height_mm
-            )
-            tile_printable_w = tile_width_mm - 2 * args.margin
-            tile_printable_h = tile_height_mm - 2 * args.margin
-            if tile_printable_w <= 0 or tile_printable_h <= 0:
+            if tile_width_mm - 2 * args.margin <= 0 or tile_height_mm - 2 * args.margin <= 0:
                 raise SystemExit("margin is too large for the selected tile paper size.")
-            available_w = tile_printable_w * tile_cols
-            available_h = tile_printable_h * tile_rows
+            # --size/--paper is the checkerboard area. Tiles only slice that area for printing.
+            available_w = paper_width_mm
+            available_h = paper_height_mm
         else:
-            available_w = paper_width_mm - 2 * args.margin
-            available_h = paper_height_mm - 2 * args.margin
-            if available_w <= 0 or available_h <= 0:
-                raise SystemExit("margin is too large for the selected paper size.")
+            if size_provided:
+                available_w = paper_width_mm
+                available_h = paper_height_mm
+            else:
+                available_w = paper_width_mm - 2 * args.margin
+                available_h = paper_height_mm - 2 * args.margin
+                if available_w <= 0 or available_h <= 0:
+                    raise SystemExit("margin is too large for the selected paper size.")
 
         if squares_provided:
             squares_x = args.squares_x
@@ -1054,7 +1143,7 @@ def main() -> int:
             if squares_x < 2 or squares_y < 2:
                 raise SystemExit("paper size is too small for the requested square-size.")
 
-        if tile_paper_provided:
+        if tile_paper_provided or size_provided:
             output_width_mm = available_w
             output_height_mm = available_h
         else:
@@ -1073,6 +1162,27 @@ def main() -> int:
     marker_size = square_size * args.marker_proportion
     board_width_mm = squares_x * square_size
     board_height_mm = squares_y * square_size
+    tile_x_spans_mm: list[float] | None = None
+    tile_y_spans_mm: list[float] | None = None
+    if tile_paper_provided:
+        origin_x_mm = max(0.0, (available_w - board_width_mm) / 2.0)
+        origin_y_mm = max(0.0, (available_h - board_height_mm) / 2.0)
+        tile_width_mm, tile_height_mm, tile_x_spans_mm, tile_y_spans_mm = (
+            _choose_tile_layout(
+                available_w,
+                available_h,
+                tile_width_mm,
+                tile_height_mm,
+                args.margin,
+                square_size,
+                origin_x_mm,
+                origin_y_mm,
+            )
+        )
+        tile_cols = len(tile_x_spans_mm)
+        tile_rows = len(tile_y_spans_mm)
+        tile_printable_w = tile_width_mm - 2 * args.margin
+        tile_printable_h = tile_height_mm - 2 * args.margin
 
     dictionary_auto = args.dictionary.lower() == DEFAULT_DICTIONARY
     if dictionary_auto:
@@ -1153,15 +1263,16 @@ def main() -> int:
     if tile_paper_provided:
         if output_format != "pdf":
             raise SystemExit("Tiled output requires PDF format.")
-        tile_content_w_px = _mm_to_px(tile_printable_w, args.dpi)
-        tile_content_h_px = _mm_to_px(tile_printable_h, args.dpi)
-        canvas_w_px = tile_content_w_px * tile_cols
-        canvas_h_px = tile_content_h_px * tile_rows
-        board_w_px = _mm_to_px(board_width_mm, args.dpi)
-        board_h_px = _mm_to_px(board_height_mm, args.dpi)
+        board_w_px, board_h_px = _board_pixel_size(
+            squares_x, squares_y, square_size, args.dpi
+        )
+        canvas_w_px = max(_mm_to_px(available_w, args.dpi), board_w_px)
+        canvas_h_px = max(_mm_to_px(available_h, args.dpi), board_h_px)
         board_img = _render_board(board, (board_w_px, board_h_px), 0, border_bits=1)
         canvas_img = np.full((canvas_h_px, canvas_w_px), 255, dtype=board_img.dtype)
         _center_paste(canvas_img, board_img)
+        col_spans_px = _spans_mm_to_px(tile_x_spans_mm, canvas_w_px, args.dpi)
+        row_spans_px = _spans_mm_to_px(tile_y_spans_mm, canvas_h_px, args.dpi)
         _write_tiled_pdf(
             output_path,
             canvas_img,
@@ -1173,16 +1284,16 @@ def main() -> int:
             dpi=args.dpi,
             cols=tile_cols,
             rows=tile_rows,
+            col_spans_px=col_spans_px,
+            row_spans_px=row_spans_px,
             details_text=details_text,
         )
         minimap_path = _minimap_path(output_path)
         _write_minimap(
             minimap_path,
             canvas_img,
-            tile_content_w_px=tile_content_w_px,
-            tile_content_h_px=tile_content_h_px,
-            cols=tile_cols,
-            rows=tile_rows,
+            col_spans_px=col_spans_px,
+            row_spans_px=row_spans_px,
         )
         width_px = canvas_w_px
         height_px = canvas_h_px
@@ -1191,8 +1302,9 @@ def main() -> int:
         height_px = _mm_to_px(output_height_mm, args.dpi)
         margin_px = _mm_to_px(args.margin, args.dpi)
         if board_bounds_provided and not fill_to_paper:
-            board_w_px = _mm_to_px(board_width_mm, args.dpi)
-            board_h_px = _mm_to_px(board_height_mm, args.dpi)
+            board_w_px, board_h_px = _board_pixel_size(
+                squares_x, squares_y, square_size, args.dpi
+            )
             board_img = _render_board(board, (board_w_px, board_h_px), 0, border_bits=1)
             img = np.full((height_px, width_px), 255, dtype=board_img.dtype)
             _center_paste(img, board_img)

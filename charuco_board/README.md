@@ -24,10 +24,10 @@ Options:
 | `--marker-proportion` | `0.7` (`(0, 1)`) | Marker side length as a fraction of square size. |
 | `--dictionary` | `auto` (OpenCV `DICT_*`) | ArUco dictionary. `auto` picks the smallest 4X4 dictionary that has enough marker IDs. |
 | `--paper` | unset (`A0`, `A1`, `A2`, `A3`, `A4`, `LETTER`, `LEGAL`, `TABLOID`) | Main board size by paper name. Cannot be combined with `--size`. |
-| `--size` | unset (`WIDTHxHEIGHT` mm) | Main board size in millimetres, e.g. `500x700`. Alternative to `--paper`. |
+| `--size` | unset (`WIDTHxHEIGHT` mm) | Checkerboard area in millimetres, e.g. `480x720`. Squares are packed into this rectangle. `--tile-paper` only slices it for printing. Cannot be combined with `--paper`. |
 | `--tile-paper` | unset (same names as `--paper`) | Tile page size for multi-page PDF output. Requires `--paper` or `--size`. Rotates the tile sheet if that covers the main board with fewer pages. |
 | `--dpi` | `300` (`> 0`) | Render resolution used to convert millimetres to pixels. |
-| `--margin` | `0` mm (`>= 0`) | Inset on each tile page, or around the board on a single-page `--paper`/`--size` run. When greater than 0, a 30% black legend of board details is drawn along an outer margin (not on edges that are cut away between tiles). |
+| `--margin` | `0` mm (`>= 0`) | Inset on each tile page, or around the board on a single-page `--paper`/`--size` run. When greater than 0, a 30% black legend is drawn just below the board on the bottom-left tile only. |
 | `--tile-bleed` | `2` mm (`>= 0`, `<= --margin` when tiling) | Overflow past crop marks on tiled pages. |
 | `--crop-mark` | `5` mm (`>= 0`) | Crop mark length on tiled pages. |
 | `--output` | `auto` (`output/<name>.pdf`, or a `.png`/`.pdf` path) | Output path. A `.png` or `.pdf` extension selects format. |
@@ -79,9 +79,10 @@ python charuco_board/generate_charuco.py \
 ```
 
 Tiling notes:
-- `--tile-paper` requires `--paper` or `--size` (the main board size).
+- `--tile-paper` requires `--paper` or `--size` (the checkerboard area). It does not change that area; it only splits it across tile pages.
+- Tile cuts snap to square borders when a square would not fully fit on the current page, so that square moves to the next tile instead of being sliced.
 - Tile sheets are rotated when landscape needs fewer pages. `--paper A2 --tile-paper A3` is two landscape A3 pages, not one portrait page.
-- `--margin` insets each tile page (and the board on a single-page `--paper`/`--size` run). That shrinks the assembled size vs the named board size; use a small margin if you need to stay close to true A2/A1. When margin is set, a 30% black details line is drawn on an outer margin, not on joins between tiles.
+- `--margin` insets each tile page (and the board on a single-page `--paper`/`--size` run). That shrinks the assembled size vs the named board size; use a small margin if you need to stay close to true A2/A1. When margin is set, a 30% black details line is drawn just below the board on the bottom-left tile only.
 - `--tile-bleed` controls the overflow beyond crop marks (default: 2 mm). Bleed must be `<=` margin.
 - `--crop-mark` controls crop mark length (default: 5 mm).
 - A minimap PNG is written next to the PDF with `_minimap.png` suffix.
