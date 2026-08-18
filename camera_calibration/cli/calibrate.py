@@ -122,8 +122,8 @@ def format_report(result) -> str:
         )
     if result.rotated_images:
         lines.append(
-            f"  Auto-rotated:    {len(result.rotated_images)} "
-            "(portrait/landscape → common orientation)"
+            f"  EXIF-normalized: {len(result.rotated_images)} "
+            "image(s) transformed into the calibration frame"
         )
     lines.extend(
         [

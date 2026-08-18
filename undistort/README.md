@@ -28,4 +28,5 @@ python -m camera_calibration undistort path/to/folder \
 | `--output` | required | Output file (one image) or output folder (a folder of images). |
 | `--alpha` | `0` (`0`–`1`) | New camera matrix scaling: `0` crops black borders, `1` keeps every source pixel. |
 
-Source images must match the calibrated resolution (or the transposed portrait/landscape size).
+Source images are normalized with the same inverse EXIF orientation as
+calibration and must then match the calibrated resolution exactly.

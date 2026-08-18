@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .images import orient_image_to_size
+from .images import normalize_to_calibration_size, read_calibration_image
 from .result import CalibrationResult
 from .undistort import undistort_image
 
@@ -533,17 +533,20 @@ def render_undistort_comparison(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    image = cv2.imread(str(image_path))
-    if image is None:
+    calibration_image = read_calibration_image(image_path)
+    if calibration_image is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
 
-    oriented = orient_image_to_size(image, calibration.image_size)
-    if oriented is None:
+    sized = normalize_to_calibration_size(
+        calibration_image.image,
+        calibration.image_size,
+    )
+    if sized is None:
         raise ValueError(
             f"Image size does not match calibration {calibration.image_size[0]}x"
-            f"{calibration.image_size[1]} (and is not a portrait/landscape transpose)"
+            f"{calibration.image_size[1]} after EXIF normalization."
         )
-    image, _was_rotated = oriented
+    image, _was_size_normalized = sized
     undistorted = undistort_image(image, calibration, alpha=alpha)
     camera_matrix, dist_coeffs = _camera_arrays(calibration)
     width, height = calibration.image_size

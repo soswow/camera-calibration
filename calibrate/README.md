@@ -64,7 +64,18 @@ Writes `output/my-lens.json` and `output/my-lens.yaml`.
 | `--camera-name` | unset (YAML field defaults to `camera`) | ROS YAML `camera_name`. When `--output-name` is omitted, also builds the output filename. |
 | `--preview-dir` | unset | Write copies of images with detected corners drawn. |
 
-Portrait and landscape shots of the same sensor are auto-rotated to one orientation.
+Calibration reads encoded pixels and applies the inverse EXIF display
+orientation before detecting corners. This lets phone portrait/landscape shots
+share one camera pixel frame without guessing a rotation from width/height
+alone. If an export has already baked the rotation into pixels and reset EXIF
+Orientation to `1`, exact portrait/landscape transposes are still normalized to
+the common calibration size. Images whose normalized dimensions still differ are
+rejected from one calibration set.
+
+Board detection also tries temporary 90-degree rotations when needed, then maps
+detected corners back into the calibration frame. A board photographed sideways
+is therefore valid; the temporary rotation is only for detection, not for the
+intrinsics fit.
 
 JSON includes `K`, Brown–Conrady `D`, RMS, FOV helpers, 35mm-equivalent focal length, used/failed image lists, and Fitzgibbon λ. ROS YAML format: [ros-camera-info-yaml.md](ros-camera-info-yaml.md).
 

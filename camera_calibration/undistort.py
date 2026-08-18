@@ -8,7 +8,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .images import IMAGE_EXTENSIONS, list_images
+from .images import (
+    IMAGE_EXTENSIONS,
+    list_images,
+    normalize_to_calibration_size,
+    read_calibration_image,
+)
 from .result import CalibrationResult
 
 
@@ -91,12 +96,19 @@ def undistort_path(
     failed: list[str] = []
 
     for image_path, destination in jobs:
-        image = cv2.imread(str(image_path))
-        if image is None:
+        calibration_image = read_calibration_image(image_path)
+        if calibration_image is None:
             failed.append(image_path.name)
             continue
 
         try:
+            sized = normalize_to_calibration_size(
+                calibration_image.image,
+                calibration.image_size,
+            )
+            if sized is None:
+                raise ValueError
+            image, _was_size_normalized = sized
             undistorted = undistort_image(image, calibration, alpha=alpha)
         except ValueError:
             failed.append(image_path.name)

@@ -9,7 +9,15 @@ import numpy as np
 from cv2 import aruco
 
 from .detection import DetectedView, DetectionSet
-from .images import choose_canonical_image_size, list_images, orient_image_to_size
+from .images import (
+    DETECTION_ROTATIONS,
+    choose_canonical_image_size,
+    list_images,
+    normalize_to_calibration_size,
+    read_calibration_image,
+    rotate_for_detection,
+    unrotate_detection_points,
+)
 from .result import BOARD_CHARUCO
 
 
@@ -79,6 +87,32 @@ def find_charuco_corners(
     return corners, ids
 
 
+def find_charuco_corners_with_detection_rotation(
+    image: np.ndarray,
+    board,
+    min_corners: int = 6,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Detect ChArUco corners with temporary image rotations.
+
+    Returned image points are mapped back to the original calibration image
+    frame. Object-point lookup remains based on ChArUco IDs, so board pose in
+    the photo does not need to match --squares-x/--squares-y visually.
+    """
+    height, width = image.shape[:2]
+    for rotation in DETECTION_ROTATIONS:
+        rotated = rotate_for_detection(image, rotation)
+        gray = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
+        detection = find_charuco_corners(gray, board, min_corners=min_corners)
+        if detection is None:
+            continue
+
+        corners, ids = detection
+        return unrotate_detection_points(corners, (width, height), rotation), ids
+
+    return None
+
+
 def draw_detected_charuco(
     image: np.ndarray,
     corners: np.ndarray,
@@ -122,19 +156,22 @@ def collect_detections(
         preview_dir.mkdir(parents=True, exist_ok=True)
 
     for image_path in images:
-        image = cv2.imread(str(image_path))
-        if image is None:
+        calibration_image = read_calibration_image(image_path)
+        if calibration_image is None:
             failed_images.append(image_path.name)
             continue
 
-        oriented = orient_image_to_size(image, image_size)
-        if oriented is None:
+        sized = normalize_to_calibration_size(calibration_image.image, image_size)
+        if sized is None:
             failed_images.append(image_path.name)
             continue
+        image, was_size_normalized = sized
 
-        image, was_rotated = oriented
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        detection = find_charuco_corners(gray, board, min_corners=min_corners)
+        detection = find_charuco_corners_with_detection_rotation(
+            image,
+            board,
+            min_corners=min_corners,
+        )
         if detection is None:
             failed_images.append(image_path.name)
             continue
@@ -146,7 +183,9 @@ def collect_detections(
                 name=image_path.name,
                 object_points=object_corners[ids_flat],
                 image_points=corners.reshape(-1, 1, 2).astype(np.float32),
-                was_rotated=was_rotated,
+                was_rotated=(
+                    calibration_image.was_transformed or was_size_normalized
+                ),
             )
         )
 
@@ -158,7 +197,10 @@ def collect_detections(
         raise RuntimeError(
             f"Need at least {min_views} successful ChArUco detections, got {len(views)}. "
             f"Failed: {failed_images}. Check --squares-x/--squares-y, "
-            "--dictionary, --marker-proportion, and that markers are readable."
+            "--dictionary, --marker-proportion, and that markers are readable. "
+            "Calibration uses inverse EXIF orientation to keep a consistent "
+            "camera pixel frame; remove or separately calibrate images whose "
+            "normalized dimensions still differ."
         )
 
     return DetectionSet(

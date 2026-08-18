@@ -8,7 +8,15 @@ import cv2
 import numpy as np
 
 from .detection import DetectedView, DetectionSet, object_points_grid
-from .images import choose_canonical_image_size, list_images, orient_image_to_size
+from .images import (
+    DETECTION_ROTATIONS,
+    choose_canonical_image_size,
+    list_images,
+    normalize_to_calibration_size,
+    read_calibration_image,
+    rotate_for_detection,
+    unrotate_detection_points,
+)
 from .result import BOARD_CHECKERBOARD
 
 
@@ -30,6 +38,7 @@ def find_corners(
     gray: np.ndarray,
     inner_corners: tuple[int, int],
     detect_scale: float = 0.35,
+    allow_swapped: bool = True,
 ) -> tuple[np.ndarray, tuple[int, int]] | None:
     """
     Detect and refine checkerboard inner corners.
@@ -50,7 +59,7 @@ def find_corners(
         scales.append(1.0)
 
     candidates = [(cols, rows)]
-    if cols != rows:
+    if allow_swapped and cols != rows:
         candidates.append((rows, cols))
 
     found_corners: np.ndarray | None = None
@@ -81,6 +90,41 @@ def find_corners(
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.001)
     refined = cv2.cornerSubPix(gray, found_corners, (11, 11), (-1, -1), criteria)
     return refined, used_size
+
+
+def find_corners_with_detection_rotation(
+    image: np.ndarray,
+    inner_corners: tuple[int, int],
+    detect_scale: float = 0.35,
+) -> tuple[np.ndarray, tuple[int, int]] | None:
+    """
+    Detect board corners, allowing temporary image rotations.
+
+    Corners are always returned in the original image coordinate frame used for
+    calibration. Rotating only the detection image removes an artificial
+    "board must be upright" restriction without mixing camera pixel frames.
+    """
+    height, width = image.shape[:2]
+    for rotation in DETECTION_ROTATIONS:
+        rotated = rotate_for_detection(image, rotation)
+        gray = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
+        detection = find_corners(
+            gray,
+            inner_corners,
+            detect_scale=detect_scale,
+            allow_swapped=False,
+        )
+        if detection is None:
+            continue
+
+        corners, used_inner = detection
+        return (
+            unrotate_detection_points(corners, (width, height), rotation),
+            used_inner,
+        )
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return find_corners(gray, inner_corners, detect_scale=detect_scale)
 
 
 def draw_detected_corners(
@@ -119,19 +163,22 @@ def collect_detections(
         preview_dir.mkdir(parents=True, exist_ok=True)
 
     for image_path in images:
-        image = cv2.imread(str(image_path))
-        if image is None:
+        calibration_image = read_calibration_image(image_path)
+        if calibration_image is None:
             failed_images.append(image_path.name)
             continue
 
-        oriented = orient_image_to_size(image, image_size)
-        if oriented is None:
+        sized = normalize_to_calibration_size(calibration_image.image, image_size)
+        if sized is None:
             failed_images.append(image_path.name)
             continue
+        image, was_size_normalized = sized
 
-        image, was_rotated = oriented
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        detection = find_corners(gray, requested_inner, detect_scale=detect_scale)
+        detection = find_corners_with_detection_rotation(
+            image,
+            requested_inner,
+            detect_scale=detect_scale,
+        )
         if detection is None:
             failed_images.append(image_path.name)
             continue
@@ -149,7 +196,9 @@ def collect_detections(
                 name=image_path.name,
                 object_points=object_points_grid(*used_inner, square_size),
                 image_points=corners,
-                was_rotated=was_rotated,
+                was_rotated=(
+                    calibration_image.was_transformed or was_size_normalized
+                ),
             )
         )
 
@@ -161,7 +210,10 @@ def collect_detections(
         raise RuntimeError(
             f"Need at least {min_views} successful detections, got {len(views)}. "
             f"Failed: {failed_images}. Check --squares-x/--squares-y "
-            "and that the board is fully visible and sharp."
+            "and that the board is fully visible and sharp. Calibration uses "
+            "inverse EXIF orientation to keep a consistent camera pixel frame; "
+            "remove or separately calibrate images whose normalized dimensions "
+            "still differ."
         )
 
     assert detected_squares is not None

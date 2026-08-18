@@ -54,6 +54,11 @@ python -m camera_calibration visualize output/ps3eye-charuco-simple.json
 
 Count **squares** (not inner corners) for both board types. `--square-size` is the measured edge of one square.
 
+Calibration reads encoded pixels and applies the inverse EXIF display
+orientation, so phone portrait/landscape shots can share one camera pixel frame
+without guessing a rotation from width/height alone. Images whose normalized
+dimensions still differ are rejected from one calibration set.
+
 ## Layout
 
 ```
