@@ -7,7 +7,12 @@ import argparse
 from camera_calibration.result import BOARD_CHARUCO, BOARD_CHECKERBOARD
 
 
-def add_board_arguments(parser: argparse.ArgumentParser, *, required_board: bool) -> None:
+def add_board_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    required_board: bool,
+    defaults_from_calibration: bool = False,
+) -> None:
     parser.add_argument(
         "--board",
         choices=(BOARD_CHARUCO, BOARD_CHECKERBOARD),
@@ -36,14 +41,28 @@ def add_board_arguments(parser: argparse.ArgumentParser, *, required_board: bool
     parser.add_argument(
         "--marker-proportion",
         type=float,
-        default=0.7,
-        help="ChArUco marker side as a fraction of square size (default: 0.7)",
+        default=None if defaults_from_calibration else 0.7,
+        help=(
+            "ChArUco marker side as a fraction of square size "
+            + (
+                "(default: value from calibration, else 0.7)"
+                if defaults_from_calibration
+                else "(default: 0.7)"
+            )
+        ),
     )
     parser.add_argument(
         "--dictionary",
         type=str,
-        default="DICT_4X4_50",
-        help="ChArUco ArUco dictionary name (default: DICT_4X4_50)",
+        default=None if defaults_from_calibration else "DICT_4X4_50",
+        help=(
+            "ChArUco ArUco dictionary name "
+            + (
+                "(default: value from calibration, else DICT_4X4_50)"
+                if defaults_from_calibration
+                else "(default: DICT_4X4_50)"
+            )
+        ),
     )
     parser.add_argument(
         "--min-charuco-corners",

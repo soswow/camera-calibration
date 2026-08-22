@@ -23,6 +23,7 @@ Or `python -m pip install -r requirements.txt` and run from the repo root. The C
 | Undistort images | `python -m camera_calibration undistort` | [undistort/README.md](undistort/README.md) |
 | Visualize K / distortion | `python -m camera_calibration visualize` | [visualize/README.md](visualize/README.md) |
 | Diagnose a capture set | `python -m camera_calibration diagnose` | [diagnose/README.md](diagnose/README.md) |
+| Validate on held-out images | `python -m camera_calibration validate` | [validate/README.md](validate/README.md) |
 | Live ChArUco (PS3 Eye) | `python live-calibration/live_charuco_calibration.py` | [live-calibration/README.md](live-calibration/README.md) |
 | PS3 Eye preview / focus | `python ps3eye-tools/test_ps3eye_preview.py` | [ps3eye-tools/README.md](ps3eye-tools/README.md) |
 
@@ -68,6 +69,7 @@ calibrate/            # folder calibration + ROS YAML notes
 undistort/
 visualize/
 diagnose/
+validate/
 live-calibration/     # PS3 Eye live ChArUco
 ps3eye-tools/         # PS3 Eye preview / focus
 docs/images/

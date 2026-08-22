@@ -55,7 +55,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         default=10,
         help="How many worst images to list (default: 10)",
     )
-    add_board_arguments(parser, required_board=False)
+    add_board_arguments(
+        parser,
+        required_board=False,
+        defaults_from_calibration=True,
+    )
     parser.set_defaults(handler=run)
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import calibrate, diagnose, generate_charuco, undistort, visualize
+from . import calibrate, diagnose, generate_charuco, undistort, validate, visualize
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -13,7 +13,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="camera-calibration",
         description=(
             "Camera calibration helpers: generate ChArUco boards, calibrate from "
-            "ChArUco or checkerboard photos, undistort, visualize, and diagnose."
+            "ChArUco or checkerboard photos, undistort, visualize, diagnose, and validate."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -22,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     undistort.add_parser(subparsers)
     visualize.add_parser(subparsers)
     diagnose.add_parser(subparsers)
+    validate.add_parser(subparsers)
     return parser
 
 
