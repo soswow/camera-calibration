@@ -791,11 +791,14 @@ def _write_tiled_pdf(
 
             tile_img[dst_y0:dst_y1, dst_x0:dst_x1] = canvas_img[src_y0:src_y1, src_x0:src_x1]
 
-            # Content is top-left aligned so last-row/column remainders stay on the join edges.
-            trim_x0 = margin_pt
-            trim_y1 = tile_h_pt - margin_pt
-            trim_x1 = trim_x0 + _mm_to_points(slice_w_mm)
-            trim_y0 = trim_y1 - _mm_to_points(slice_h_mm)
+            # Center the slice on the page. A full printable span sits on the margin;
+            # a shorter span (square-snapped cut) splits the leftover equally.
+            slice_w_pt = _mm_to_points(slice_w_mm)
+            slice_h_pt = _mm_to_points(slice_h_mm)
+            trim_x0 = (tile_w_pt - slice_w_pt) / 2.0
+            trim_y0 = (tile_h_pt - slice_h_pt) / 2.0
+            trim_x1 = trim_x0 + slice_w_pt
+            trim_y1 = trim_y0 + slice_h_pt
             draw_w_pt = _mm_to_points(slice_w_mm + 2 * tile_bleed_mm)
             draw_h_pt = _mm_to_points(slice_h_mm + 2 * tile_bleed_mm)
             draw_x_pt = trim_x0 - bleed_pt

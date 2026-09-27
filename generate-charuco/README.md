@@ -75,7 +75,7 @@ Tiled output requires PDF format.
 - `--tile-paper` requires `--paper` or `--size` (the board area). It does not change that area; it only splits it across tile pages.
 - Tile cuts snap to square borders when a square would not fully fit on the current page, so that square moves to the next tile instead of being sliced.
 - Tile sheets are rotated when landscape needs fewer pages. `--paper A2 --tile-paper A3` is two landscape A3 pages, not one portrait page.
-- `--margin` insets each tile page (and the board on a single-page `--paper`/`--size` run). That shrinks the assembled size vs the named board size; use a small margin if you need to stay close to true A2/A1. When margin is set, a 30% black details line is drawn just below the board on the bottom-left tile only.
+- `--margin` is the minimum inset on each tile page (and around the board on a single-page `--paper`/`--size` run). A tile slice shorter than the printable area is centered on that page, so leftover space is equal on the left and right, and equal on the top and bottom. When margin is set, a 30% black details line is drawn just below the board on the bottom-left tile only.
 - `--tile-bleed` must be `<=` margin. Default bleed is 2 mm; default crop mark length is 5 mm.
 - A minimap PNG is written next to the PDF with `_minimap.png` suffix.
 
