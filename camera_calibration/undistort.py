@@ -26,6 +26,12 @@ def undistort_image(
     image: np.ndarray,
     calibration: CalibrationResult,
     alpha: float = 0.0,
+    *,
+    projection="perspective",
+    fov=100.0,
+    yaw=0.0,
+    pitch=0.0,
+    output_size=None,
 ) -> np.ndarray:
     """
     Remove lens distortion from a BGR image.
@@ -33,6 +39,24 @@ def undistort_image(
     alpha=0 crops to the largest valid rectangle (no black borders).
     alpha=1 keeps all source pixels (may introduce black borders).
     """
+    if (
+        calibration.is_angular
+        or projection != "perspective"
+        or yaw
+        or pitch
+        or output_size
+    ):
+        from .render import remap_view
+
+        return remap_view(
+            image,
+            calibration,
+            projection=projection,
+            fov=fov,
+            yaw=yaw,
+            pitch=pitch,
+            output_size=output_size,
+        )[0]
     height, width = image.shape[:2]
     calibrated_width, calibrated_height = calibration.image_size
     if (width, height) != (calibrated_width, calibrated_height):
@@ -84,6 +108,7 @@ def undistort_path(
     calibration: CalibrationResult,
     output: Path,
     alpha: float = 0.0,
+    **render_options,
 ) -> UndistortBatchResult:
     """
     Undistort a single image or every image in a folder.
@@ -96,7 +121,7 @@ def undistort_path(
     failed: list[str] = []
 
     for image_path, destination in jobs:
-        calibration_image = read_calibration_image(image_path)
+        calibration_image = read_calibration_image(image_path, calibration.pixel_policy)
         if calibration_image is None:
             failed.append(image_path.name)
             continue
@@ -105,11 +130,14 @@ def undistort_path(
             sized = normalize_to_calibration_size(
                 calibration_image.image,
                 calibration.image_size,
+                calibration.pixel_policy,
             )
             if sized is None:
                 raise ValueError
             image, _was_size_normalized = sized
-            undistorted = undistort_image(image, calibration, alpha=alpha)
+            undistorted = undistort_image(
+                image, calibration, alpha=alpha, **render_options
+            )
         except ValueError:
             failed.append(image_path.name)
             continue

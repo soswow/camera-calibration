@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
@@ -43,19 +43,21 @@ def score_views(
     detections: DetectionSet,
     camera_matrix: np.ndarray,
     dist_coeffs: np.ndarray,
+    model=None,
 ) -> list[ViewScore]:
     """Per-view reprojection stats and pose descriptors from a fitted model."""
     width, height = detections.image_size
     scores: list[ViewScore] = []
 
     for view in detections.views:
-        ok, rvec, tvec = cv2.solvePnP(
-            view.object_points,
-            view.image_points,
-            camera_matrix,
-            dist_coeffs,
-        )
-        if not ok:
+        from .models import CameraModel
+
+        camera = model or CameraModel(camera_matrix, dist_coeffs)
+        try:
+            pose = camera.estimate_board_pose(view.object_points, view.image_points)
+            rvec, tvec = pose[:3], pose[3:]
+            projected = camera.project(view.object_points, pose)
+        except (ValueError, cv2.error):
             scores.append(
                 ViewScore(
                     name=view.name,
@@ -70,9 +72,6 @@ def score_views(
             )
             continue
 
-        projected, _ = cv2.projectPoints(
-            view.object_points, rvec, tvec, camera_matrix, dist_coeffs
-        )
         residuals = view.image_points.reshape(-1, 2) - projected.reshape(-1, 2)
         norms = np.linalg.norm(residuals, axis=1)
         points = view.image_points.reshape(-1, 2)
@@ -90,14 +89,16 @@ def score_views(
                 center_y=float(center[1] / height),
                 span=float(max(span[0], span[1])),
                 distance=float(np.linalg.norm(tvec)),
-                tilt_deg=_tilt_deg(rvec),
+                tilt_deg=incidence_deg(camera, rvec, tvec),
             )
         )
 
     return scores
 
 
-def _coverage_key(score: ViewScore, dist_edges: tuple[float, float]) -> tuple[int, int, int, int]:
+def _coverage_key(
+    score: ViewScore, dist_edges: tuple[float, float]
+) -> tuple[int, int, int, int]:
     """Coarse pose/location bucket used to preserve diversity."""
     spatial_x = min(2, int(score.center_x * 3))
     spatial_y = min(2, int(score.center_y * 3))
@@ -150,7 +151,9 @@ def select_views(
                 f"mean error {score.mean_error_px:.2f}px > threshold {threshold:.2f}px"
             )
             continue
-        if hard_close_tilt and score.mean_error_px > max(initial_rms, np.median([s.mean_error_px for s in scores])):
+        if hard_close_tilt and score.mean_error_px > max(
+            initial_rms, np.median([s.mean_error_px for s in scores])
+        ):
             rejected.append(score.name)
             reasons[score.name] = (
                 f"close+steep tilt (tilt={score.tilt_deg:.0f}°, span={score.span:.2f}) "
@@ -182,7 +185,10 @@ def select_views(
 
     distances = [score.distance for score in inliers]
     if len(distances) >= 3:
-        dist_edges = (float(np.percentile(distances, 33)), float(np.percentile(distances, 66)))
+        dist_edges = (
+            float(np.percentile(distances, 33)),
+            float(np.percentile(distances, 66)),
+        )
     else:
         dist_edges = (float(min(distances)), float(max(distances)))
 
@@ -209,14 +215,15 @@ def select_views(
         for score in inliers:
             if score.name not in selected_names:
                 rejected.append(score.name)
-                reasons[score.name] = f"dropped for diversity budget (max_keep={max_keep})"
+                reasons[score.name] = (
+                    f"dropped for diversity budget (max_keep={max_keep})"
+                )
 
     # Anything in inliers but not selected was capped by max_keep; already handled.
     kept_names = [score.name for score in selected]
     # Preserve stable ordering by rising error for reproducibility in reports.
     kept_names = [
-        score.name
-        for score in sorted(selected, key=lambda item: item.mean_error_px)
+        score.name for score in sorted(selected, key=lambda item: item.mean_error_px)
     ]
 
     return AutoSelectResult(
@@ -234,16 +241,7 @@ def filter_detections(detections: DetectionSet, kept_names: list[str]) -> Detect
     views = [view for view in detections.views if view.name in keep]
     if len(views) < 3:
         raise RuntimeError(f"Auto-select kept only {len(views)} views; need at least 3")
-    return DetectionSet(
-        image_size=detections.image_size,
-        pattern_size=detections.pattern_size,
-        square_size=detections.square_size,
-        views=views,
-        failed_images=list(detections.failed_images),
-        board_type=detections.board_type,
-        dictionary=detections.dictionary,
-        marker_proportion=detections.marker_proportion,
-    )
+    return replace(detections, views=views)
 
 
 def auto_select_and_refit(
@@ -254,17 +252,22 @@ def auto_select_and_refit(
     error_floor_px: float = 2.0,
     max_keep: int | None = None,
     min_keep: int = 10,
+    fit_options=None,
 ) -> tuple[CalibrationResult, AutoSelectResult]:
     """
     Fit on all detections, select a robust diverse subset, refit.
 
     Returns (CalibrationResult, AutoSelectResult).
     """
-    initial = fit_intrinsics(detections, distortion_model=distortion_model)
+    initial = fit_intrinsics(
+        detections, distortion_model=distortion_model, **(fit_options or {})
+    )
     camera_matrix = np.asarray(initial.camera_matrix, dtype=np.float64)
     dist_coeffs = np.asarray(initial.distortion_coefficients, dtype=np.float64)
 
-    scores = score_views(detections, camera_matrix, dist_coeffs)
+    from .models import model_for
+
+    scores = score_views(detections, camera_matrix, dist_coeffs, model_for(initial))
     selection = select_views(
         scores,
         initial.rms_reprojection_error,
@@ -275,7 +278,9 @@ def auto_select_and_refit(
     )
 
     filtered = filter_detections(detections, selection.kept_names)
-    refined = fit_intrinsics(filtered, distortion_model=distortion_model)
+    refined = fit_intrinsics(
+        filtered, distortion_model=distortion_model, **(fit_options or {})
+    )
 
     # Annotate selection metadata on the result object.
     refined.failed_images = list(
@@ -285,8 +290,14 @@ def auto_select_and_refit(
     refined.auto_select_rejected = selection.rejected_names
     refined.auto_select_threshold_px = selection.error_threshold_px
     refined.initial_rms_reprojection_error = selection.initial_rms
-    refined.rotated_images = [
-        view.name for view in filtered.views if view.was_rotated
-    ]
+    refined.rotated_images = [view.name for view in filtered.views if view.was_rotated]
 
     return refined, selection
+
+
+def incidence_deg(camera, rvec, tvec):
+    if not camera.is_angular:
+        return _tilt_deg(rvec)
+    normal = cv2.Rodrigues(rvec)[0][:, 2]
+    view = tvec / np.linalg.norm(tvec)
+    return float(np.degrees(np.arccos(np.clip(abs(normal @ view), 0, 1))))

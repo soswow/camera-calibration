@@ -36,21 +36,19 @@ def create_board(
     square_size: float,
     marker_proportion: float,
     dictionary,
+    legacy_pattern=False,
+    first_marker_id=0,
 ):
-    marker_size = square_size * marker_proportion
-    if hasattr(aruco, "CharucoBoard"):
-        return aruco.CharucoBoard(
-            (squares_x, squares_y),
-            square_size,
-            marker_size,
-            dictionary,
-        )
-    return aruco.CharucoBoard_create(
+    from .board import make_board
+
+    return make_board(
         squares_x,
         squares_y,
         square_size,
-        marker_size,
+        square_size * marker_proportion,
         dictionary,
+        legacy_pattern=legacy_pattern,
+        first_marker_id=first_marker_id,
     )
 
 
@@ -64,33 +62,73 @@ def find_charuco_corners(
     gray: np.ndarray,
     board,
     min_corners: int = 6,
+    details=None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """
     Detect interpolated ChArUco chessboard corners.
 
     Returns (corners, ids) or None when too few corners are found.
     """
-    if hasattr(aruco, "CharucoDetector"):
-        detector = aruco.CharucoDetector(board)
-        corners, ids, _marker_corners, _marker_ids = detector.detectBoard(gray)
-    else:
-        dictionary = board.getDictionary() if hasattr(board, "getDictionary") else board.dictionary
-        marker_corners, marker_ids, _ = aruco.detectMarkers(gray, dictionary)
-        if marker_ids is None or len(marker_ids) < 1:
-            return None
-        _, corners, ids = aruco.interpolateCornersCharuco(
-            marker_corners, marker_ids, gray, board
+    if details is None:
+        details = {}
+    attempts = details.setdefault("attempts", [])
+    parameters = aruco.CharucoParameters()
+    parameters.checkMarkers = True
+    detector = aruco.CharucoDetector(board, parameters)
+    h, w = gray.shape
+    best = None
+    for scale in (1.0, 0.75, 0.5, 0.33):
+        sw, sh = max(16, round(w * scale)), max(16, round(h * scale))
+        search = (
+            gray
+            if scale == 1
+            else cv2.resize(gray, (sw, sh), interpolation=cv2.INTER_AREA)
         )
-
-    if corners is None or ids is None or len(ids) < min_corners:
-        return None
-    return corners, ids
+        corners, ids, _, _ = detector.detectBoard(search)
+        attempt = {
+            "scale_xy": [sw / w, sh / h],
+            "detected_corners": 0 if ids is None else len(ids),
+            "usable": False,
+        }
+        attempts.append(attempt)
+        if corners is None or ids is None:
+            continue
+        xy = (corners.reshape(-1, 2).astype(float) + 0.5) / np.array(
+            [sw / w, sh / h]
+        ) - 0.5
+        if scale != 1:
+            refined = cv2.cornerSubPix(
+                gray,
+                xy.astype(np.float32).reshape(-1, 1, 2),
+                (3, 3),
+                (-1, -1),
+                (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 40, 0.01),
+            ).reshape(-1, 2)
+            good = np.isfinite(refined).all(axis=1) & (
+                np.linalg.norm(refined - xy, axis=1) <= 2 / min(sw / w, sh / h)
+            )
+            xy, ids = refined[good], ids[good]
+        if len(ids) < min_corners:
+            continue
+        objects = board_chessboard_corners(board)[ids.ravel()]
+        if np.linalg.matrix_rank(objects - objects.mean(axis=0)) < 2:
+            continue
+        attempt.update(usable=True, retained_corners=len(ids))
+        candidate = (xy.astype(np.float32).reshape(-1, 1, 2), ids)
+        if scale == 1:
+            details["selected_scale_xy"] = [sw / w, sh / h]
+            return candidate
+        if best is None or len(ids) > len(best[1]):
+            best = candidate
+            details["selected_scale_xy"] = [sw / w, sh / h]
+    return best
 
 
 def find_charuco_corners_with_detection_rotation(
     image: np.ndarray,
     board,
     min_corners: int = 6,
+    details=None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """
     Detect ChArUco corners with temporary image rotations.
@@ -103,7 +141,12 @@ def find_charuco_corners_with_detection_rotation(
     for rotation in DETECTION_ROTATIONS:
         rotated = rotate_for_detection(image, rotation)
         gray = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
-        detection = find_charuco_corners(gray, board, min_corners=min_corners)
+        trial = {"rotation_degrees": rotation}
+        detection = find_charuco_corners(
+            gray, board, min_corners=min_corners, details=trial
+        )
+        if details is not None:
+            details.setdefault("rotation_attempts", []).append(trial)
         if detection is None:
             continue
 
@@ -136,6 +179,10 @@ def collect_detections(
     min_corners: int = 6,
     preview_dir: Path | None = None,
     min_views: int = 3,
+    pixel_policy="encoded",
+    masks=None,
+    legacy_pattern=False,
+    first_marker_id=0,
 ) -> DetectionSet:
     """Detect ChArUco corners in every image (partial boards are allowed)."""
     images = list_images(folder)
@@ -144,10 +191,16 @@ def collect_detections(
 
     dictionary = get_dictionary(dictionary_name)
     board = create_board(
-        squares_x, squares_y, square_size, marker_proportion, dictionary
+        squares_x,
+        squares_y,
+        square_size,
+        marker_proportion,
+        dictionary,
+        legacy_pattern,
+        first_marker_id,
     )
     object_corners = board_chessboard_corners(board)
-    image_size = choose_canonical_image_size(images)
+    image_size = choose_canonical_image_size(images, pixel_policy)
 
     views: list[DetectedView] = []
     failed_images: list[str] = []
@@ -156,36 +209,70 @@ def collect_detections(
         preview_dir.mkdir(parents=True, exist_ok=True)
 
     for image_path in images:
-        calibration_image = read_calibration_image(image_path)
+        calibration_image = read_calibration_image(image_path, pixel_policy)
         if calibration_image is None:
             failed_images.append(image_path.name)
             continue
 
-        sized = normalize_to_calibration_size(calibration_image.image, image_size)
+        sized = normalize_to_calibration_size(
+            calibration_image.image, image_size, pixel_policy
+        )
         if sized is None:
             failed_images.append(image_path.name)
             continue
         image, was_size_normalized = sized
 
+        from .masks import mask_for
+        from .observations import image_hash
+
+        excluded = mask_for(image.shape, (masks or {}).get(image_path.name, []))
+        search = image.copy()
+        search[excluded != 0] = 127
+        details = {
+            "multiscale_fallback": True,
+            "check_markers": True,
+            "exclusion_polygons": (masks or {}).get(image_path.name, []),
+        }
         detection = find_charuco_corners_with_detection_rotation(
-            image,
+            search,
             board,
             min_corners=min_corners,
+            details=details,
         )
         if detection is None:
             failed_images.append(image_path.name)
             continue
 
         corners, ids = detection
+        margin = cv2.dilate(excluded, np.ones((25, 25), np.uint8))
+        xy = np.rint(corners.reshape(-1, 2)).astype(int)
+        good = (
+            margin[
+                np.clip(xy[:, 1], 0, image.shape[0] - 1),
+                np.clip(xy[:, 0], 0, image.shape[1] - 1),
+            ]
+            == 0
+        )
+        corners, ids = corners[good], ids[good]
+        if (
+            len(ids) < min_corners
+            or np.linalg.matrix_rank(
+                object_corners[ids.ravel()] - object_corners[ids.ravel()].mean(axis=0)
+            )
+            < 2
+        ):
+            failed_images.append(image_path.name)
+            continue
         ids_flat = ids.flatten()
         views.append(
             DetectedView(
                 name=image_path.name,
+                source_sha256=image_hash(image_path),
+                corner_ids=ids_flat.tolist(),
+                detection_details=details,
                 object_points=object_corners[ids_flat],
                 image_points=corners.reshape(-1, 1, 2).astype(np.float32),
-                was_rotated=(
-                    calibration_image.was_transformed or was_size_normalized
-                ),
+                was_rotated=(calibration_image.was_transformed or was_size_normalized),
             )
         )
 
@@ -205,6 +292,9 @@ def collect_detections(
 
     return DetectionSet(
         image_size=image_size,
+        pixel_policy=pixel_policy,
+        board_legacy_pattern=legacy_pattern,
+        board_first_marker_id=first_marker_id,
         pattern_size=(squares_x, squares_y),
         square_size=square_size,
         views=views,

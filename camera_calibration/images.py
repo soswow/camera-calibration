@@ -93,25 +93,31 @@ def normalize_for_calibration(
     exif_orientation: int,
 ) -> tuple[np.ndarray, bool]:
     """
-    Return pixels in the calibration frame.
+    Reproduce the historical inverse-EXIF policy for legacy profiles only.
 
-    The calibration frame is the inverse of EXIF display orientation: it undoes
-    orientation metadata intended for viewing so that photos taken with different
-    phone rotations can share one camera pixel coordinate frame.
+    New calibrations keep encoded pixels; do not call this on their input.
     """
     inverse_orientation = inverse_exif_orientation(exif_orientation)
     normalized = apply_exif_orientation(image, inverse_orientation)
     return normalized, inverse_orientation != 1
 
 
-def read_calibration_image(path: Path | str) -> CalibrationImage | None:
+def read_calibration_image(
+    path: Path | str, pixel_policy: str = "encoded"
+) -> CalibrationImage | None:
     """Read image pixels and normalize them into the calibration frame."""
     image = imread_sensor(path)
     if image is None:
         return None
 
     exif_orientation = read_exif_orientation(path)
-    normalized, was_transformed = normalize_for_calibration(image, exif_orientation)
+    if pixel_policy not in {"encoded", "legacy-exif"}:
+        raise ValueError("Unknown pixel coordinate policy")
+    normalized, was_transformed = (
+        normalize_for_calibration(image, exif_orientation)
+        if pixel_policy == "legacy-exif"
+        else (image, False)
+    )
     return CalibrationImage(
         image=normalized,
         exif_orientation=exif_orientation,
@@ -128,17 +134,18 @@ def list_images(folder: Path) -> list[Path]:
     )
 
 
-def choose_canonical_image_size(images: list[Path]) -> tuple[int, int]:
+def choose_canonical_image_size(
+    images: list[Path], pixel_policy: str = "encoded"
+) -> tuple[int, int]:
     """
     Pick the (width, height) used for calibration.
 
-    Images are normalized with inverse EXIF display orientation before sizing.
-    A consistent calibration needs all accepted views in one fixed pixel
-    coordinate frame.
+    Read using the selected coordinate policy and choose the most common size.
+    A consistent calibration needs one fixed pixel frame.
     """
     counts: Counter[tuple[int, int]] = Counter()
     for image_path in images:
-        calibration_image = read_calibration_image(image_path)
+        calibration_image = read_calibration_image(image_path, pixel_policy)
         if calibration_image is None:
             continue
         image = calibration_image.image
@@ -166,18 +173,21 @@ def require_image_size(
 def normalize_to_calibration_size(
     image: np.ndarray,
     target_size: tuple[int, int],
+    pixel_policy: str = "encoded",
 ) -> tuple[np.ndarray, bool] | None:
     """
-    Return image in target size, allowing only exact portrait/landscape transpose.
+    Require an exact size for new encoded-pixel profiles.
 
-    EXIF normalization is preferred. This fallback handles exports where display
-    rotation has already been baked into pixels and EXIF Orientation is reset.
+    The transpose guess is retained only for old profiles using legacy-exif.
     """
     height, width = image.shape[:2]
     target_width, target_height = target_size
     if (width, height) == (target_width, target_height):
         return image, False
-    if (width, height) == (target_height, target_width):
+    if pixel_policy == "legacy-exif" and (width, height) == (
+        target_height,
+        target_width,
+    ):
         return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE), True
     return None
 

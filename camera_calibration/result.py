@@ -51,6 +51,33 @@ class CalibrationResult:
     fitzgibbon_lambda: float | None = None
     fitzgibbon_rms_reprojection_error: float | None = None
 
+    schema_version: int = 2
+    asymmetric_coefficients: tuple[float, float] = (0.0, 0.0)
+    max_angle_deg: float = 110.0
+    pixel_policy: str = "encoded"
+    optimizer: dict | None = None
+    validation: dict | None = None
+    provenance: dict | None = None
+    board_legacy_pattern: bool = False
+    board_first_marker_id: int = 0
+
+    def __post_init__(self):
+        from .models import model_for
+
+        if self.schema_version not in {1, 2}:
+            raise ValueError("Unsupported calibration schema version")
+        if self.pixel_policy not in {"encoded", "legacy-exif"}:
+            raise ValueError("Unknown pixel coordinate policy")
+        if len(self.image_size) != 2 or min(self.image_size) <= 0:
+            raise ValueError("Image dimensions must be positive")
+        model_for(self).check_domain()
+
+    @property
+    def is_angular(self):
+        from .models import ANGULAR_MODELS
+
+        return self.distortion_model in ANGULAR_MODELS
+
     @property
     def fx(self) -> float:
         return self.camera_matrix[0][0]
@@ -70,18 +97,24 @@ class CalibrationResult:
     @property
     def hfov_deg(self) -> float:
         """Horizontal field of view in degrees (pinhole model from K)."""
+        if self.is_angular:
+            return None  # K alone does not determine the supported fisheye FOV.
         width, _ = self.image_size
         return math.degrees(2.0 * math.atan(width / (2.0 * self.fx)))
 
     @property
     def vfov_deg(self) -> float:
         """Vertical field of view in degrees (pinhole model from K)."""
+        if self.is_angular:
+            return None  # K alone does not determine the supported fisheye FOV.
         _, height = self.image_size
         return math.degrees(2.0 * math.atan(height / (2.0 * self.fy)))
 
     @property
     def dfov_deg(self) -> float:
         """Diagonal field of view in degrees (pinhole model from K)."""
+        if self.is_angular:
+            return None  # K alone does not determine the supported fisheye FOV.
         width, height = self.image_size
         half_diag = math.hypot(width / (2.0 * self.fx), height / (2.0 * self.fy))
         return math.degrees(2.0 * math.atan(half_diag))
@@ -93,6 +126,8 @@ class CalibrationResult:
 
         Matches the calibrated diagonal FOV on a 36×24 mm full-frame sensor.
         """
+        if self.is_angular:
+            return None
         return (FULL_FRAME_DIAGONAL_MM / 2.0) / math.tan(
             math.radians(self.dfov_deg) / 2.0
         )
@@ -120,6 +155,14 @@ class CalibrationResult:
         Compatible with ROS camera_calibration_parsers and many tools that
         expect ~/.ros/camera_info/<name>.yaml style files.
         """
+        if self.is_angular:
+            raise ValueError(
+                "Angular profiles cannot be exported as Brown plumb_bob YAML; use JSON"
+            )
+        if len(self.distortion_coefficients) > 5:
+            raise ValueError(
+                "This YAML exporter supports only four/five-term Brown profiles"
+            )
         width, height = self.image_size
         dist = list(self.distortion_coefficients[:5])
         while len(dist) < 5:
@@ -127,29 +170,40 @@ class CalibrationResult:
 
         def matrix_block(name: str, rows: int, cols: int, data: list[float]) -> str:
             values = ", ".join(repr(float(value)) for value in data)
-            return (
-                f"{name}:\n"
-                f"  rows: {rows}\n"
-                f"  cols: {cols}\n"
-                f"  data: [{values}]\n"
-            )
+            return f"{name}:\n  rows: {rows}\n  cols: {cols}\n  data: [{values}]\n"
 
         k_data = [
-            self.fx, 0.0, self.cx,
-            0.0, self.fy, self.cy,
-            0.0, 0.0, 1.0,
+            self.fx,
+            0.0,
+            self.cx,
+            0.0,
+            self.fy,
+            self.cy,
+            0.0,
+            0.0,
+            1.0,
         ]
         r_data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         p_data = [
-            self.fx, 0.0, self.cx, 0.0,
-            0.0, self.fy, self.cy, 0.0,
-            0.0, 0.0, 1.0, 0.0,
+            self.fx,
+            0.0,
+            self.cx,
+            0.0,
+            0.0,
+            self.fy,
+            self.cy,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
         ]
 
         body = (
             f"image_width: {width}\n"
             f"image_height: {height}\n"
             f"camera_name: {camera_name}\n"
+            f"pixel_policy: {self.pixel_policy}\n"
             f"{matrix_block('camera_matrix', 3, 3, k_data)}"
             f"distortion_model: plumb_bob\n"
             f"{matrix_block('distortion_coefficients', 1, 5, dist)}"
@@ -183,7 +237,9 @@ class CalibrationResult:
             rms = data.get("reprojection_error", 0.0)
 
         board = data.get("board") if isinstance(data.get("board"), dict) else {}
-        board_type = str(data.get("board_type") or board.get("type") or BOARD_CHECKERBOARD)
+        board_type = str(
+            data.get("board_type") or board.get("type") or BOARD_CHECKERBOARD
+        )
         if "squares_x" in board and "board_type" not in data:
             board_type = BOARD_CHARUCO
 
@@ -203,14 +259,31 @@ class CalibrationResult:
             dictionary = board.get("dictionary")
 
         marker_proportion = data.get("marker_proportion")
-        if marker_proportion is None and board.get("square_size_mm") and board.get("marker_size_mm"):
-            marker_proportion = float(board["marker_size_mm"]) / float(board["square_size_mm"])
+        if (
+            marker_proportion is None
+            and board.get("square_size_mm")
+            and board.get("marker_size_mm")
+        ):
+            marker_proportion = float(board["marker_size_mm"]) / float(
+                board["square_size_mm"]
+            )
 
         used_images = data.get("used_images")
         if used_images is None and data.get("frames_used") is not None:
             used_images = [str(index) for index in range(int(data["frames_used"]))]
 
         return cls(
+            schema_version=int(data.get("schema_version", 1)),
+            asymmetric_coefficients=tuple(
+                data.get("asymmetric_coefficients", (0.0, 0.0))
+            ),
+            max_angle_deg=float(data.get("max_angle_deg", 110.0)),
+            pixel_policy=data.get("pixel_policy", "legacy-exif"),
+            optimizer=data.get("optimizer"),
+            validation=data.get("validation"),
+            provenance=data.get("provenance"),
+            board_legacy_pattern=bool(data.get("board_legacy_pattern", False)),
+            board_first_marker_id=int(data.get("board_first_marker_id", 0)),
             image_size=(int(data["image_size"][0]), int(data["image_size"][1])),
             camera_matrix=camera_matrix,
             distortion_coefficients=distortion_coefficients,
@@ -225,9 +298,13 @@ class CalibrationResult:
             marker_proportion=(
                 float(marker_proportion) if marker_proportion is not None else None
             ),
-            rotated_images=list(data["rotated_images"]) if data.get("rotated_images") else [],
+            rotated_images=list(data["rotated_images"])
+            if data.get("rotated_images")
+            else [],
             auto_select_rejected=(
-                list(data["auto_select_rejected"]) if data.get("auto_select_rejected") else None
+                list(data["auto_select_rejected"])
+                if data.get("auto_select_rejected")
+                else None
             ),
             auto_select_threshold_px=(
                 float(data["auto_select_threshold_px"])
@@ -277,7 +354,9 @@ class CalibrationResult:
             width = int(payload["image_width"])
             height = int(payload["image_height"])
             k_data = list(payload["camera_matrix"]["data"])
-            d_data = [float(value) for value in payload["distortion_coefficients"]["data"]]
+            d_data = [
+                float(value) for value in payload["distortion_coefficients"]["data"]
+            ]
         except (KeyError, TypeError) as error:
             raise ValueError(
                 f"YAML {path} is missing camera_info fields "
@@ -285,7 +364,9 @@ class CalibrationResult:
             ) from error
 
         if len(k_data) != 9:
-            raise ValueError(f"camera_matrix.data must have 9 values, got {len(k_data)}")
+            raise ValueError(
+                f"camera_matrix.data must have 9 values, got {len(k_data)}"
+            )
 
         camera_matrix = [
             [float(k_data[0]), float(k_data[1]), float(k_data[2])],
@@ -305,6 +386,7 @@ class CalibrationResult:
             pattern_size=(0, 0),
             square_size=0.0,
             distortion_model=yaml_model,
+            pixel_policy=str(payload.get("pixel_policy", "legacy-exif")),
             fitzgibbon_lambda=(
                 float(fitzgibbon_lambda) if fitzgibbon_lambda is not None else None
             ),
@@ -319,6 +401,5 @@ class CalibrationResult:
         if suffix in {".yaml", ".yml"}:
             return cls.from_yaml(path)
         raise ValueError(
-            f"Unsupported calibration file {path} "
-            "(expected .json, .yaml, or .yml)"
+            f"Unsupported calibration file {path} (expected .json, .yaml, or .yml)"
         )

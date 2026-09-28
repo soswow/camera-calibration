@@ -1,6 +1,8 @@
 # Calibrate
 
-Estimate camera intrinsics from a folder of **ChArUco** or **checkerboard** photos. Always writes JSON and ROS/OpenCV YAML.
+For angular fisheye models, see the [single-image fisheye workflow](../docs/fisheye.md).
+
+Estimate camera intrinsics from a folder of **ChArUco** or **checkerboard** photos. Writes JSON, plus ROS/OpenCV YAML for Brown models. The CLI reserves every fifth distinct view by default; use `--validation-every 0` only to explicitly disable validation.
 
 Count **squares** for both board types (`--squares-x` / `--squares-y`). Checkerboard detection still uses OpenCV inner corners internally (squares minus one); you do not pass that.
 
@@ -54,7 +56,7 @@ Writes `output/my-lens.json` and `output/my-lens.yaml`.
 | `--dictionary` | `DICT_4X4_50` | **ChArUco only.** OpenCV ArUco dictionary name. |
 | `--min-charuco-corners` | `6` (`>= 4`) | **ChArUco only.** Minimum interpolated corners to accept a view. |
 | `--detect-scale` | `0.35` | **Checkerboard only.** Preferred downscale for corner detection on large photos. |
-| `--model` | `simple` (`simple`, `full`, `k1`) | Distortion model. `simple` = k1,k2 only (stabler); `full` = k1..k3 + tangential (can overfit); `k1` = radial k1 only. |
+| `--model` | `simple` (`simple`, `full`, `k1`, `angular`, `angular-asymmetric`) | Distortion model. `simple` = k1,k2 only (stabler); `full` = k1..k3 + tangential (can overfit); `k1` = radial k1 only. |
 | `--auto-select` | off | Fit, drop high-residual / hard close-tilt outliers while keeping pose diversity, then refit. |
 | `--auto-select-max-keep` | unset (`>= 3`) | Cap on views kept after auto-select. |
 | `--auto-select-error-factor` | `1.5` | Reject views with mean error &gt; factor × initial RMS. |

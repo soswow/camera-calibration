@@ -62,6 +62,7 @@ class ImageValidation:
     used_for_calibration: bool
     auto_select_rejected: bool
     visualization: str | None = None
+    spherical_straightness: dict | None = None
 
 
 @dataclass
@@ -83,6 +84,7 @@ class ValidationReport:
     images: list[ImageValidation]
     failed_images: dict[str, str] = field(default_factory=dict)
     overlap_images: list[str] = field(default_factory=list)
+    validation_spherical_straightness: dict | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -179,6 +181,10 @@ def render_validation_overlay(
     line_opacity: float = 0.55,
 ) -> Path:
     """Write an undistorted image with translucent fitted grid lines."""
+    if calibration.is_angular:
+        return render_angular_overlay(
+            image, view, calibration, result, destination, line_opacity=line_opacity
+        )
     camera_matrix = np.asarray(calibration.camera_matrix, dtype=np.float64)
     dist_coeffs = np.asarray(calibration.distortion_coefficients, dtype=np.float64)
     width, height = calibration.image_size
@@ -206,7 +212,7 @@ def render_validation_overlay(
     line_layer = undistorted_image.copy()
     thickness = max(2, int(round(max(width, height) / 1000.0)))
     colors = {
-        "row": (0, 180, 255),      # amber in BGR
+        "row": (0, 180, 255),  # amber in BGR
         "column": (255, 170, 0),  # blue/cyan in BGR
     }
     for label, line_points in _grid_line_groups(
@@ -295,35 +301,31 @@ def validate_view(
     object_points = np.asarray(view.object_points, dtype=np.float64)
     image_points = np.asarray(view.image_points, dtype=np.float64)
 
-    ok, rvec, tvec = cv2.solvePnP(
-        object_points,
-        image_points,
-        camera_matrix,
-        dist_coeffs,
-    )
-    if not ok:
-        raise RuntimeError("pose estimation failed")
+    from .models import model_for
 
-    projected, _ = cv2.projectPoints(
-        object_points,
-        rvec,
-        tvec,
-        camera_matrix,
-        dist_coeffs,
-    )
+    model = model_for(calibration)
+    pose = model.estimate_board_pose(object_points, image_points)
+    projected = model.project(object_points, pose)
     residual_vectors = image_points.reshape(-1, 2) - projected.reshape(-1, 2)
     reprojection_errors = np.linalg.norm(residual_vectors, axis=1)
 
-    undistorted = cv2.undistortPoints(
-        image_points.reshape(-1, 1, 2),
-        camera_matrix,
-        dist_coeffs,
-        P=camera_matrix,
-    ).reshape(-1, 2)
-    line_errors, row_lines, column_lines = straightness_errors(
-        object_points,
-        undistorted,
-    )
+    spherical = None
+    if calibration.is_angular:
+        spherical = spherical_straightness(
+            object_points, model.unproject_pixels(image_points)
+        )
+        line_errors = np.empty(0)
+        row_lines = column_lines = 0
+    else:
+        undistorted = cv2.undistortPoints(
+            image_points.reshape(-1, 1, 2),
+            camera_matrix,
+            dist_coeffs,
+            P=camera_matrix,
+        ).reshape(-1, 2)
+        line_errors, row_lines, column_lines = straightness_errors(
+            object_points, undistorted
+        )
     straightness = None
     if line_errors.size:
         line_summary = _error_metrics(line_errors)
@@ -338,9 +340,21 @@ def validate_view(
         )
 
     used_names = set(calibration.used_images)
+    excluded_names = set((calibration.validation or {}).get("excluded_duplicates", []))
+    used_names.update(excluded_names)
+    if view.source_sha256 and calibration.provenance:
+        sources = calibration.provenance.get("sources", {})
+        training = (
+            excluded_names
+            | set(calibration.used_images)
+            | set(calibration.auto_select_rejected or [])
+        )
+        if view.source_sha256 in {sources.get(name) for name in training}:
+            used_names.add(view.name)
     rejected_names = set(calibration.auto_select_rejected or [])
     result = ImageValidation(
         name=view.name,
+        spherical_straightness=spherical,
         corner_count=int(len(reprojection_errors)),
         reprojection=_error_metrics(reprojection_errors),
         straightness=straightness,
@@ -375,6 +389,7 @@ def _detect_views(
     dictionary: str,
     min_charuco_corners: int,
     detect_scale: float,
+    masks=None,
 ) -> tuple[list[_DetectedValidationImage], dict[str, str]]:
     images = _resolve_images(source)
     detected_images: list[_DetectedValidationImage] = []
@@ -390,6 +405,8 @@ def _detect_views(
             square_size,
             marker_proportion,
             get_dictionary(dictionary),
+            calibration.board_legacy_pattern,
+            calibration.board_first_marker_id,
         )
         charuco_object_points = board_chessboard_corners(charuco_board)
     elif board_type == BOARD_CHECKERBOARD:
@@ -398,11 +415,13 @@ def _detect_views(
         raise ValueError(f"Unknown board type {board_type!r}")
 
     for image_path in images:
-        loaded = read_calibration_image(image_path)
+        loaded = read_calibration_image(image_path, calibration.pixel_policy)
         if loaded is None:
             failed[image_path.name] = "image could not be read"
             continue
-        sized = normalize_to_calibration_size(loaded.image, calibration.image_size)
+        sized = normalize_to_calibration_size(
+            loaded.image, calibration.image_size, calibration.pixel_policy
+        )
         if sized is None:
             height, width = loaded.image.shape[:2]
             expected_width, expected_height = calibration.image_size
@@ -412,11 +431,16 @@ def _detect_views(
             )
             continue
         image, was_size_normalized = sized
+        from .masks import mask_for
+
+        excluded = mask_for(image.shape, (masks or {}).get(image_path.name, []))
+        search = image.copy()
+        search[excluded != 0] = 127
 
         if board_type == BOARD_CHARUCO:
             assert charuco_board is not None and charuco_object_points is not None
             detection = find_charuco_corners_with_detection_rotation(
-                image,
+                search,
                 charuco_board,
                 min_corners=min_charuco_corners,
             )
@@ -428,7 +452,7 @@ def _detect_views(
         else:
             assert checkerboard_inner is not None
             detection = find_corners_with_detection_rotation(
-                image,
+                search,
                 checkerboard_inner,
                 detect_scale=detect_scale,
             )
@@ -438,8 +462,24 @@ def _detect_views(
             corners, used_inner = detection
             object_points = object_points_grid(*used_inner, square_size)
 
+        margin = cv2.dilate(excluded, np.ones((25, 25), np.uint8))
+        xy = np.rint(corners.reshape(-1, 2)).astype(int)
+        good = (
+            margin[
+                np.clip(xy[:, 1], 0, image.shape[0] - 1),
+                np.clip(xy[:, 0], 0, image.shape[1] - 1),
+            ]
+            == 0
+        )
+        corners, object_points = corners[good], object_points[good]
+        if len(corners) < (min_charuco_corners if board_type == BOARD_CHARUCO else 4):
+            failed[image_path.name] = "Too few corners outside exclusions"
+            continue
+        from .observations import image_hash
+
         view = DetectedView(
             name=image_path.name,
+            source_sha256=image_hash(image_path),
             object_points=np.asarray(object_points, dtype=np.float32),
             image_points=np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2),
             was_rotated=loaded.was_transformed or was_size_normalized,
@@ -478,12 +518,15 @@ def validate_calibration(
     visualization_output: Path | None = None,
     visualization_alpha: float = 0.0,
     line_opacity: float = 0.55,
+    masks=None,
 ) -> ValidationReport:
     """Detect validation boards and score them against fixed saved intrinsics."""
     resolved_board = board_type or calibration.board_type
     resolved_x = squares_x if squares_x is not None else calibration.pattern_size[0]
     resolved_y = squares_y if squares_y is not None else calibration.pattern_size[1]
-    resolved_square = square_size if square_size is not None else calibration.square_size
+    resolved_square = (
+        square_size if square_size is not None else calibration.square_size
+    )
     resolved_marker = (
         marker_proportion
         if marker_proportion is not None
@@ -500,6 +543,8 @@ def validate_calibration(
     if not (0.0 < resolved_marker < 1.0):
         raise ValueError("--marker-proportion must be in (0, 1)")
 
+    if masks is None:
+        masks = (calibration.provenance or {}).get("masks", {})
     detected_images, failed = _detect_views(
         source,
         calibration,
@@ -511,6 +556,7 @@ def validate_calibration(
         dictionary=resolved_dictionary,
         min_charuco_corners=min_charuco_corners,
         detect_scale=detect_scale,
+        masks=masks,
     )
     if not detected_images:
         details = "; ".join(f"{name}: {reason}" for name, reason in failed.items())
@@ -525,7 +571,7 @@ def validate_calibration(
         view = detected.view
         try:
             result, reprojection_errors, line_errors = validate_view(view, calibration)
-        except RuntimeError as error:
+        except (RuntimeError, ValueError, cv2.error) as error:
             failed[view.name] = str(error)
             continue
         image_results.append(result)
@@ -587,4 +633,109 @@ def validate_calibration(
         images=image_results,
         failed_images=failed,
         overlap_images=overlap,
+        validation_spherical_straightness=pooled_spherical(image_results),
     )
+
+
+def spherical_straightness(objects, rays):
+    """A spatial straight line lies in a plane through the camera center."""
+    errors = []
+    counts = {"row": 0, "column": 0}
+    objects = np.asarray(objects).reshape(-1, 3)
+    for label, axis in [("row", 1), ("column", 0)]:
+        for coordinate in np.unique(objects[:, axis]):
+            subset = rays[np.isclose(objects[:, axis], coordinate)]
+            if len(subset) < 4:
+                continue
+            _, _, vh = np.linalg.svd(subset, full_matrices=False)
+            errors.extend(
+                np.degrees(np.arcsin(np.clip(np.abs(subset @ vh[-1]), 0, 1))).tolist()
+            )
+            counts[label] += 1
+    if not errors:
+        return None
+    return {
+        "rms_deg": float(np.sqrt(np.mean(np.square(errors)))),
+        "median_deg": float(np.median(errors)),
+        "p95_deg": float(np.percentile(errors, 95)),
+        "max_deg": float(np.max(errors)),
+        "distance_count": len(errors),
+        "row_lines": counts["row"],
+        "column_lines": counts["column"],
+    }
+
+
+def render_angular_overlay(
+    image, view, calibration, result, destination, line_opacity=0.55
+):
+    from .models import model_for, tangent_basis
+    from .render import remap_view
+
+    model = model_for(calibration)
+    rays = model.unproject_pixels(view.image_points)
+    basis = tangent_basis(rays)
+    local = rays @ basis
+    if np.any(local[:, 2] <= 0):
+        raise ValueError("Board cannot fit one tangent overlay")
+    xy = local[:, :2] / local[:, 2:]
+    width, height = calibration.image_size
+    extent = (
+        max(np.max(np.abs(xy[:, 0])), np.max(np.abs(xy[:, 1])) * width / height) * 1.15
+    )
+    fov = np.degrees(2 * np.arctan(max(extent, 0.1)))
+    if fov >= 175:
+        raise ValueError("Board tangent view exceeds 175 degrees")
+    rendered, _ = remap_view(image, calibration, fov=fov, basis=basis)
+    focal = width / (2 * np.tan(np.deg2rad(fov) / 2))
+    points = xy * focal + [(width - 1) / 2, (height - 1) / 2]
+    layer = rendered.copy()
+    for label, line in _grid_line_groups(
+        view.object_points, points, min_points_per_line=4
+    ):
+        first, last = _fitted_line_segment(line)
+        cv2.line(
+            layer,
+            first,
+            last,
+            (0, 180, 255) if label == "row" else (255, 170, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    rendered = cv2.addWeighted(layer, line_opacity, rendered, 1 - line_opacity, 0)
+    for pt in points:
+        cv2.circle(rendered, tuple(np.rint(pt).astype(int)), 3, (255, 255, 255), -1)
+    text = f"Tangent view | native RMS {result.reprojection.rms_px:.3f}px"
+    if result.used_for_calibration or result.auto_select_rejected:
+        text = "NOT HELD OUT | " + text
+    if result.spherical_straightness:
+        text += f" | line RMS {result.spherical_straightness['rms_deg']:.5f}deg"
+    cv2.putText(
+        rendered,
+        text,
+        (16, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(destination), rendered):
+        raise RuntimeError("Could not write overlay")
+    return destination
+
+
+def pooled_spherical(images):
+    metrics = [r.spherical_straightness for r in images if r.spherical_straightness]
+    count = sum(m["distance_count"] for m in metrics)
+    if not count:
+        return None
+    return {
+        "rms_deg": float(
+            np.sqrt(
+                sum(m["rms_deg"] ** 2 * m["distance_count"] for m in metrics) / count
+            )
+        ),
+        "distance_count": count,
+    }

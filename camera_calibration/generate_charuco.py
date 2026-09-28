@@ -159,6 +159,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_FORMAT,
         help=f"Output format. Default: {DEFAULT_FORMAT}.",
     )
+    parser.add_argument("--legacy-pattern", action="store_true")
+    parser.add_argument("--first-marker-id", type=int, default=0)
     return parser.parse_args(argv)
 
 
@@ -241,30 +243,45 @@ def _create_board(
     square_size: float,
     marker_size: float,
     dictionary,
+    legacy_pattern=False,
+    first_marker_id=0,
 ):
-    if hasattr(aruco, "CharucoBoard"):
-        return aruco.CharucoBoard(
-            (squares_x, squares_y),
-            square_size,
-            marker_size,
-            dictionary,
-        )
-    return aruco.CharucoBoard_create(
+    from .board import make_board
+
+    return make_board(
         squares_x,
         squares_y,
         square_size,
         marker_size,
         dictionary,
+        legacy_pattern=legacy_pattern,
+        first_marker_id=first_marker_id,
     )
 
 
 def _render_board(board, size: tuple[int, int], margin_px: int, border_bits: int):
     try:
         if hasattr(board, "generateImage"):
-            return board.generateImage(size, marginSize=margin_px, borderBits=border_bits)
+            return board.generateImage(
+                size, marginSize=margin_px, borderBits=border_bits
+            )
         return board.draw(size, marginSize=margin_px, borderBits=border_bits)
     except cv2.error as exc:
         message = str(exc)
+        if "roi.x" in message:
+            # Some OpenCV builds round unequal raster axes inconsistently.
+            # Render exact integer squares, then center without resampling.
+            sx, sy = board.getChessboardSize()
+            step = min((size[0] - 2 * margin_px) // sx, (size[1] - 2 * margin_px) // sy)
+            if step <= 0:
+                raise ValueError("Output raster is too small for the board") from exc
+            raster = board.generateImage(
+                (sx * step, sy * step), marginSize=0, borderBits=border_bits
+            )
+            canvas = np.full((size[1], size[0]), 255, dtype=np.uint8)
+            x, y = (size[0] - raster.shape[1]) // 2, (size[1] - raster.shape[0]) // 2
+            canvas[y : y + raster.shape[0], x : x + raster.shape[1]] = raster
+            return canvas
         if "generateImageMarker" in message or "bytesList" in message:
             raise SystemExit(
                 "OpenCV failed to draw a marker because the dictionary is too small "
@@ -431,7 +448,9 @@ def _draw_raster_margin_details(img, text: str, margin_px: int):
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
-def _write_png(output_path: str, img, details_text: str | None = None, margin_px: int = 0) -> None:
+def _write_png(
+    output_path: str, img, details_text: str | None = None, margin_px: int = 0
+) -> None:
     if details_text and margin_px > 0:
         img = _draw_raster_margin_details(img, details_text, margin_px)
     ok = cv2.imwrite(output_path, img)
@@ -607,7 +626,7 @@ def _draw_crop_marks(
             step = dash_len if end >= start else -dash_len
             idx = 0
             pos = start
-            while (pos <= end if step > 0 else pos >= end):
+            while pos <= end if step > 0 else pos >= end:
                 next_pos = pos + step
                 if step > 0:
                     seg_end = min(next_pos, end)
@@ -626,7 +645,7 @@ def _draw_crop_marks(
             step = dash_len if end >= start else -dash_len
             idx = 0
             pos = start
-            while (pos <= end if step > 0 else pos >= end):
+            while pos <= end if step > 0 else pos >= end:
                 next_pos = pos + step
                 if step > 0:
                     seg_end = min(next_pos, end)
@@ -789,7 +808,9 @@ def _write_tiled_pdf(
             dst_x1 = dst_x0 + (src_x1 - src_x0)
             dst_y1 = dst_y0 + (src_y1 - src_y0)
 
-            tile_img[dst_y0:dst_y1, dst_x0:dst_x1] = canvas_img[src_y0:src_y1, src_x0:src_x1]
+            tile_img[dst_y0:dst_y1, dst_x0:dst_x1] = canvas_img[
+                src_y0:src_y1, src_x0:src_x1
+            ]
 
             # Center the slice on the page. A full printable span sits on the margin;
             # a shorter span (square-snapped cut) splits the leftover equally.
@@ -814,7 +835,9 @@ def _write_tiled_pdf(
                 preserveAspectRatio=False,
                 mask="auto",
             )
-            _draw_crop_marks(pdf, trim_x0, trim_y0, trim_x1, trim_y1, mark_len_pt, stroke_pt)
+            _draw_crop_marks(
+                pdf, trim_x0, trim_y0, trim_x1, trim_y1, mark_len_pt, stroke_pt
+            )
             _draw_tile_label(
                 pdf,
                 f"r{row}c{col}",
@@ -1049,11 +1072,17 @@ def main(argv: list[str] | None = None) -> int:
     if paper_provided and size_provided:
         raise SystemExit("Use either --paper or --size, not both.")
     if tile_paper_provided and not board_bounds_provided:
-        raise SystemExit("--tile-paper requires --paper or --size to set the main size.")
+        raise SystemExit(
+            "--tile-paper requires --paper or --size to set the main size."
+        )
     if square_size_provided and target_size_provided:
-        raise SystemExit("Use either --square-size (exact) or --target-square-size (fill), not both.")
+        raise SystemExit(
+            "Use either --square-size (exact) or --target-square-size (fill), not both."
+        )
     if target_size_provided and squares_provided:
-        raise SystemExit("--target-square-size cannot be combined with --squares-x/--squares-y.")
+        raise SystemExit(
+            "--target-square-size cannot be combined with --squares-x/--squares-y."
+        )
     if target_size_provided and not board_bounds_provided:
         raise SystemExit("--target-square-size requires --paper or --size.")
 
@@ -1098,8 +1127,13 @@ def main(argv: list[str] | None = None) -> int:
         if tile_paper_provided:
             tile_width_mm, tile_height_mm = _paper_size_mm(args.tile_paper)
             tile_label = args.tile_paper.upper()
-            if tile_width_mm - 2 * args.margin <= 0 or tile_height_mm - 2 * args.margin <= 0:
-                raise SystemExit("margin is too large for the selected tile paper size.")
+            if (
+                tile_width_mm - 2 * args.margin <= 0
+                or tile_height_mm - 2 * args.margin <= 0
+            ):
+                raise SystemExit(
+                    "margin is too large for the selected tile paper size."
+                )
             # --size/--paper is the checkerboard area. Tiles only slice that area for printing.
             available_w = paper_width_mm
             available_h = paper_height_mm
@@ -1145,7 +1179,9 @@ def main(argv: list[str] | None = None) -> int:
             squares_x = int(math.floor(available_w / square_size + 1e-9))
             squares_y = int(math.floor(available_h / square_size + 1e-9))
             if squares_x < 2 or squares_y < 2:
-                raise SystemExit("paper size is too small for the requested square-size.")
+                raise SystemExit(
+                    "paper size is too small for the requested square-size."
+                )
 
         if tile_paper_provided or size_provided:
             output_width_mm = available_w
@@ -1190,7 +1226,7 @@ def main(argv: list[str] | None = None) -> int:
 
     dictionary_auto = args.dictionary.lower() == DEFAULT_DICTIONARY
     if dictionary_auto:
-        needed_estimate = (squares_x * squares_y) // 2
+        needed_estimate = (squares_x * squares_y) // 2 + args.first_marker_id
         dictionary_name = _select_dictionary(needed_estimate)
     else:
         dictionary_name = args.dictionary
@@ -1201,6 +1237,8 @@ def main(argv: list[str] | None = None) -> int:
         square_size,
         marker_size,
         dictionary,
+        legacy_pattern=args.legacy_pattern,
+        first_marker_id=args.first_marker_id,
     )
     needed_markers = _board_required_marker_count(board)
     if dictionary_auto and needed_markers > _dictionary_size(dictionary):
@@ -1332,10 +1370,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  output: {output_path}")
     print(f"  squares: {squares_x} x {squares_y}")
     print(f"  square size (mm): {_fmt_mm_floor(square_size)}")
-    if (
-        target_size_provided
-        and abs(square_size - args.target_square_size) > 0.01
-    ):
+    if target_size_provided and abs(square_size - args.target_square_size) > 0.01:
         print(f"  requested square size (mm): {_fmt_mm_floor(args.target_square_size)}")
     print(f"  marker proportion: {args.marker_proportion}")
     print(f"  marker size (mm): {_fmt_mm_floor(marker_size)}")
@@ -1351,9 +1386,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"  {size_kind}: {paper_label}")
     if tile_paper_provided:
-        tile_orientation = (
-            "landscape" if tile_width_mm > tile_height_mm else "portrait"
-        )
+        tile_orientation = "landscape" if tile_width_mm > tile_height_mm else "portrait"
         print(f"  tile paper: {tile_label} ({tile_orientation})")
         print(f"  tiles: {tile_cols} x {tile_rows}")
         print(f"  tile margin (mm): {_fmt_mm_floor(args.margin)}")
@@ -1374,6 +1407,26 @@ def main(argv: list[str] | None = None) -> int:
             f" {_fmt_mm_floor(output_width_mm)} x {_fmt_mm_floor(output_height_mm)}"
         )
     print(f"  pixels: {width_px} x {height_px}")
+    import json
+    from pathlib import Path
+
+    board_path = Path(output_path).with_suffix(".board.json")
+    board_path.write_text(
+        json.dumps(
+            {
+                "squares_x": squares_x,
+                "squares_y": squares_y,
+                "square_mm": square_size,
+                "marker_mm": marker_size,
+                "dictionary": dictionary_name,
+                "legacy_pattern": args.legacy_pattern,
+                "first_marker_id": args.first_marker_id,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    print(f"  board definition: {board_path}")
     return 0
 
 

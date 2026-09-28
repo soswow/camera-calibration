@@ -1,5 +1,7 @@
 # Visualize
 
+For angular fisheye models, see the [single-image fisheye workflow](../docs/fisheye.md).
+
 Plot camera matrix and distortion from a calibration JSON or ROS `camera_info` YAML: warped grid, undistort displacement, radial curve, and an optional before/after photo.
 
 ```bash

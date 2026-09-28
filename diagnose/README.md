@@ -1,5 +1,7 @@
 # Diagnose
 
+For angular fisheye models, see the [single-image fisheye workflow](../docs/fisheye.md).
+
 Re-detect the board in a folder of photos and report coverage gaps, tilt/distance variety, and per-image reprojection error.
 
 Board geometry is taken from the calibration JSON when present. Pass the board flags if you only have ROS YAML (no `pattern_size`).

@@ -85,7 +85,10 @@ def find_corners(
         return None
 
     if used_scale < 1.0:
-        found_corners = found_corners / used_scale
+        found_corners = (found_corners + 0.5) / np.array(
+            [search.shape[1] / gray.shape[1], search.shape[0] / gray.shape[0]]
+        ) - 0.5
+        found_corners = found_corners.astype(np.float32)
 
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.001)
     refined = cv2.cornerSubPix(gray, found_corners, (11, 11), (-1, -1), criteria)
@@ -146,6 +149,8 @@ def collect_detections(
     detect_scale: float = 0.35,
     preview_dir: Path | None = None,
     min_views: int = 3,
+    pixel_policy="encoded",
+    masks=None,
 ) -> DetectionSet:
     """Detect checkerboard corners in every image."""
     images = list_images(folder)
@@ -153,7 +158,7 @@ def collect_detections(
         raise FileNotFoundError(f"No images found in {folder}")
 
     requested_inner = inner_corners_from_squares(squares_x, squares_y)
-    image_size = choose_canonical_image_size(images)
+    image_size = choose_canonical_image_size(images, pixel_policy)
 
     views: list[DetectedView] = []
     failed_images: list[str] = []
@@ -163,19 +168,27 @@ def collect_detections(
         preview_dir.mkdir(parents=True, exist_ok=True)
 
     for image_path in images:
-        calibration_image = read_calibration_image(image_path)
+        calibration_image = read_calibration_image(image_path, pixel_policy)
         if calibration_image is None:
             failed_images.append(image_path.name)
             continue
 
-        sized = normalize_to_calibration_size(calibration_image.image, image_size)
+        sized = normalize_to_calibration_size(
+            calibration_image.image, image_size, pixel_policy
+        )
         if sized is None:
             failed_images.append(image_path.name)
             continue
         image, was_size_normalized = sized
 
+        from .masks import mask_for
+        from .observations import image_hash
+
+        excluded = mask_for(image.shape, (masks or {}).get(image_path.name, []))
+        search = image.copy()
+        search[excluded != 0] = 127
         detection = find_corners_with_detection_rotation(
-            image,
+            search,
             requested_inner,
             detect_scale=detect_scale,
         )
@@ -184,6 +197,16 @@ def collect_detections(
             continue
 
         corners, used_inner = detection
+        margin = cv2.dilate(excluded, np.ones((25, 25), np.uint8))
+        xy = np.rint(corners.reshape(-1, 2)).astype(int)
+        if np.any(
+            margin[
+                np.clip(xy[:, 1], 0, image.shape[0] - 1),
+                np.clip(xy[:, 0], 0, image.shape[1] - 1),
+            ]
+        ):
+            failed_images.append(image_path.name)
+            continue
         used_squares = squares_from_inner_corners(*used_inner)
         if detected_squares is None:
             detected_squares = used_squares
@@ -194,11 +217,10 @@ def collect_detections(
         views.append(
             DetectedView(
                 name=image_path.name,
+                source_sha256=image_hash(image_path),
                 object_points=object_points_grid(*used_inner, square_size),
                 image_points=corners,
-                was_rotated=(
-                    calibration_image.was_transformed or was_size_normalized
-                ),
+                was_rotated=(calibration_image.was_transformed or was_size_normalized),
             )
         )
 
@@ -219,6 +241,7 @@ def collect_detections(
     assert detected_squares is not None
     return DetectionSet(
         image_size=image_size,
+        pixel_policy=pixel_policy,
         pattern_size=detected_squares,
         square_size=square_size,
         views=views,

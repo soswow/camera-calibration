@@ -148,7 +148,9 @@ def _assess_gaps(
     dist_min, dist_max = min(distances), max(distances)
     dist_ratio = dist_max / max(dist_min, 1e-6)
 
-    high_error = [image for image in images if image.mean_error_px > max(2.0, overall_rms * 1.5)]
+    high_error = [
+        image for image in images if image.mean_error_px > max(2.0, overall_rms * 1.5)
+    ]
     high_error_fraction = len(high_error) / n
 
     if overall_rms > 1.5:
@@ -202,7 +204,11 @@ def _assess_gaps(
                 )
             )
 
-    missing_quadrants = [name for name, count in quadrant_counts.items() if name != "center" and count == 0]
+    missing_quadrants = [
+        name
+        for name, count in quadrant_counts.items()
+        if name != "center" and count == 0
+    ]
     if missing_quadrants:
         gaps.append(
             CoverageGap(
@@ -285,7 +291,10 @@ def _assess_gaps(
         )
 
     if high_error_fraction > 0.15:
-        names = ", ".join(image.name for image in sorted(high_error, key=lambda item: -item.mean_error_px)[:5])
+        names = ", ".join(
+            image.name
+            for image in sorted(high_error, key=lambda item: -item.mean_error_px)[:5]
+        )
         gaps.append(
             CoverageGap(
                 code="outlier_views",
@@ -304,7 +313,11 @@ def _assess_gaps(
         "median_mean_error": float(np.median(mean_errors)),
         "max_mean_error": float(np.max(mean_errors)),
         "quadrant_counts": quadrant_counts,
-        "tilt_bins": {"low_<15": tilt_low, "med_15_30": tilt_med, "high_>=30": tilt_high},
+        "tilt_bins": {
+            "low_<15": tilt_low,
+            "med_15_30": tilt_med,
+            "high_>=30": tilt_high,
+        },
         "distance_min": float(dist_min),
         "distance_max": float(dist_max),
         "distance_ratio": float(dist_ratio),
@@ -328,27 +341,23 @@ def diagnose_detections(
     grid_size: int = 12,
 ) -> DiagnosisReport:
     """Score collected views against saved intrinsics for coverage / outliers."""
-    camera_matrix = np.asarray(calibration.camera_matrix, dtype=np.float64)
-    dist_coeffs = np.asarray(calibration.distortion_coefficients, dtype=np.float64)
     image_size = detections.image_size
     diagnoses: list[ImageDiagnosis] = []
     failed: list[str] = list(detections.failed_images)
     spatial = np.zeros((grid_size, grid_size), dtype=np.int32)
 
     for view in detections.views:
-        ok, rvec, tvec = cv2.solvePnP(
-            view.object_points,
-            view.image_points,
-            camera_matrix,
-            dist_coeffs,
-        )
-        if not ok:
+        from .models import model_for
+
+        camera = model_for(calibration)
+        try:
+            pose = camera.estimate_board_pose(view.object_points, view.image_points)
+            rvec, tvec = pose[:3], pose[3:]
+            projected = camera.project(view.object_points, pose)
+        except (ValueError, cv2.error):
             failed.append(view.name)
             continue
 
-        projected, _ = cv2.projectPoints(
-            view.object_points, rvec, tvec, camera_matrix, dist_coeffs
-        )
         residuals = view.image_points.reshape(-1, 2) - projected.reshape(-1, 2)
         norms = np.linalg.norm(residuals, axis=1)
 
@@ -359,6 +368,10 @@ def diagnose_detections(
         width, height = image_size
         span = max_xy - min_xy
         tilt_deg, roll_deg = _rotation_tilt_roll(rvec)
+        if calibration.is_angular:
+            from .auto_select import incidence_deg
+
+            tilt_deg = incidence_deg(camera, rvec, tvec)
         distance = float(np.linalg.norm(tvec))
 
         center_x = float(center[0] / width)
@@ -385,6 +398,32 @@ def diagnose_detections(
         raise RuntimeError(f"No diagnosable views. Failed: {failed}")
 
     gaps, summary = _assess_gaps(diagnoses, spatial, calibration.rms_reprojection_error)
+    if calibration.is_angular:
+        gaps = [
+            g
+            for g in gaps
+            if g.code not in {"missing_frame_corners", "sparse_spatial_coverage"}
+        ]
+        summary["coverage_note"] = (
+            "Rectangular corner gaps may be outside a circular lens. Angular sector coverage is measured from detected rays."
+        )
+        rays = np.concatenate(
+            [
+                model_for(calibration).unproject_pixels(v.image_points)
+                for v in detections.views
+            ]
+        )
+        theta = np.degrees(np.arctan2(np.hypot(rays[:, 0], rays[:, 1]), rays[:, 2]))
+        azimuth = np.arctan2(rays[:, 1], rays[:, 0])
+        counts, _, _ = np.histogram2d(
+            theta,
+            azimuth,
+            bins=[
+                np.linspace(0, calibration.max_angle_deg, 6),
+                np.linspace(-np.pi, np.pi, 9),
+            ],
+        )
+        summary["angular_sector_corner_counts"] = counts.astype(int).tolist()
     return DiagnosisReport(
         image_size=image_size,
         pattern_size=detections.pattern_size,
@@ -413,6 +452,7 @@ def diagnose_calibration(
     marker_proportion: float | None = None,
     dictionary: str | None = None,
     min_charuco_corners: int = 6,
+    masks=None,
 ) -> DiagnosisReport:
     """
     Analyze pose/location coverage and per-image reprojection error.
@@ -426,14 +466,20 @@ def diagnose_calibration(
     pattern = tuple(calibration.pattern_size)
     size = float(square_size if square_size is not None else calibration.square_size)
 
-    resolved_x = squares_x if squares_x is not None else (pattern[0] if pattern[0] else None)
-    resolved_y = squares_y if squares_y is not None else (pattern[1] if pattern[1] else None)
+    resolved_x = (
+        squares_x if squares_x is not None else (pattern[0] if pattern[0] else None)
+    )
+    resolved_y = (
+        squares_y if squares_y is not None else (pattern[1] if pattern[1] else None)
+    )
     if resolved_x is None or resolved_y is None:
         raise ValueError(
             "Diagnose needs --squares-x/--squares-y "
             "(or a JSON file that stores pattern_size)."
         )
 
+    if masks is None:
+        masks = (calibration.provenance or {}).get("masks", {})
     detections = collect_board_detections(
         folder=folder,
         board=board_type,
@@ -449,6 +495,10 @@ def diagnose_calibration(
         dictionary=dictionary or calibration.dictionary or "DICT_4X4_50",
         min_charuco_corners=min_charuco_corners,
         min_views=1,
+        masks=masks,
+        pixel_policy=calibration.pixel_policy,
+        legacy_pattern=calibration.board_legacy_pattern,
+        first_marker_id=calibration.board_first_marker_id,
     )
     return diagnose_detections(detections, calibration, grid_size=grid_size)
 
@@ -489,9 +539,7 @@ def render_diagnosis_image(report: DiagnosisReport, path: Path) -> Path:
     axis.set_xlim(0, 1)
     axis.set_ylim(1, 0)  # image coords: y down
     axis.set_aspect(height / width)
-    axis.add_patch(
-        Rectangle((0, 0), 1, 1, fill=False, edgecolor="0.4", linewidth=1.2)
-    )
+    axis.add_patch(Rectangle((0, 0), 1, 1, fill=False, edgecolor="0.4", linewidth=1.2))
     axis.axhline(0.3, color="0.85", linewidth=0.6, linestyle="--")
     axis.axhline(0.7, color="0.85", linewidth=0.6, linestyle="--")
     axis.axvline(0.3, color="0.85", linewidth=0.6, linestyle="--")
@@ -567,13 +615,21 @@ def render_diagnosis_image(report: DiagnosisReport, path: Path) -> Path:
     # --- Panel 4: worst views ---
     axis = axes[1, 1]
     worst = images[: min(12, len(images))]
-    labels = [image.name.replace(".MP.jpg", "").replace(".jpg", "")[-15:] for image in worst]
+    labels = [
+        image.name.replace(".MP.jpg", "").replace(".jpg", "")[-15:] for image in worst
+    ]
     values = [image.mean_error_px for image in worst]
     colors = plt.cm.magma(np.clip(np.array(values) / error_vmax, 0.0, 1.0))
     axis.barh(range(len(worst))[::-1], values[::-1], color=colors[::-1])
     axis.set_yticks(range(len(worst)))
     axis.set_yticklabels(labels[::-1], fontsize=8)
-    axis.axvline(report.overall_rms, color="crimson", linestyle="--", linewidth=1.0, label="overall RMS")
+    axis.axvline(
+        report.overall_rms,
+        color="crimson",
+        linestyle="--",
+        linewidth=1.0,
+        label="overall RMS",
+    )
     axis.set_xlabel("Mean reprojection error (px)")
     axis.set_title("Worst views")
     axis.legend(loc="lower right", fontsize=8)

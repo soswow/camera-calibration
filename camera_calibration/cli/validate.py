@@ -65,6 +65,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         required_board=False,
         defaults_from_calibration=True,
     )
+    parser.add_argument(
+        "--masks", type=Path, help="Per-image normalized exclusion polygons JSON"
+    )
     parser.set_defaults(handler=run)
 
 
@@ -95,6 +98,10 @@ def format_report(report) -> str:
             f"lines {straight.row_lines} row/{straight.column_lines} column"
         )
 
+    if report.validation_spherical_straightness:
+        lines.append(
+            f"  Spherical line RMS: {report.validation_spherical_straightness['rms_deg']:.6f} degrees"
+        )
     lines.extend(["", "Per-image validation:"])
     for image in sorted(report.images, key=lambda item: -item.reprojection.rms_px):
         marker = "  [NOT HELD OUT]" if image.name in report.overlap_images else ""
@@ -103,6 +110,10 @@ def format_report(report) -> str:
             f"p95 {image.reprojection.p95_px:7.3f}  "
             f"corners {image.corner_count:4d}  {image.name}{marker}"
         )
+        if image.spherical_straightness:
+            lines.append(
+                f"        spherical line RMS {image.spherical_straightness['rms_deg']:.6f} degrees"
+            )
         if image.visualization:
             lines.append(f"        visualization: {image.visualization}")
 
@@ -146,6 +157,8 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         calibration = CalibrationResult.from_path(args.calibration)
+        from camera_calibration.masks import load_masks
+
         report = validate_calibration(
             args.images,
             calibration,
@@ -161,6 +174,7 @@ def run(args: argparse.Namespace) -> int:
             visualization_output=visualization_output,
             visualization_alpha=args.alpha,
             line_opacity=args.line_opacity,
+            masks=load_masks(args.masks) if args.masks else None,
         )
     except (FileNotFoundError, RuntimeError, json.JSONDecodeError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)

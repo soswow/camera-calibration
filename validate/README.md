@@ -1,5 +1,7 @@
 # Validate
 
+For angular fisheye models, see the [single-image fisheye workflow](../docs/fisheye.md).
+
 Measure genuine held-out reprojection error and undistorted grid straightness
 using a saved calibration. The command accepts one board image or a folder.
 Saved intrinsics remain fixed; only the pose of each validation board is fitted.

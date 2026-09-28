@@ -60,6 +60,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         required_board=False,
         defaults_from_calibration=True,
     )
+    parser.add_argument(
+        "--masks", type=Path, help="Per-image normalized exclusion polygons JSON"
+    )
     parser.set_defaults(handler=run)
 
 
@@ -131,6 +134,8 @@ def run(args: argparse.Namespace) -> int:
         calibration = CalibrationResult.from_path(args.calibration)
         if args.board is None:
             args.board = calibration.board_type
+        from camera_calibration.masks import load_masks
+
         report = diagnose_calibration(
             folder=args.images,
             calibration=calibration,
@@ -142,6 +147,7 @@ def run(args: argparse.Namespace) -> int:
             marker_proportion=args.marker_proportion,
             dictionary=args.dictionary,
             min_charuco_corners=args.min_charuco_corners,
+            masks=load_masks(args.masks) if args.masks else None,
         )
     except (FileNotFoundError, RuntimeError, json.JSONDecodeError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)

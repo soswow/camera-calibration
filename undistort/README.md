@@ -1,5 +1,7 @@
 # Undistort
 
+For angular fisheye models, see the [single-image fisheye workflow](../docs/fisheye.md).
+
 Remove lens distortion from one image or a folder, using saved intrinsics JSON or ROS `camera_info` YAML (including live ChArUco JSON).
 
 ```bash

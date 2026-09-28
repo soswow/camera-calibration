@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import cv2
+
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -29,7 +32,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         type=Path,
         help="Folder with calibration images",
     )
-    add_board_arguments(parser, required_board=True)
+    add_board_arguments(parser, required_board=False)
     parser.add_argument(
         "--output-folder",
         type=Path,
@@ -63,18 +66,84 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     parser.add_argument(
         "--model",
-        choices=("simple", "full", "k1"),
+        choices=("simple", "full", "k1", "angular", "angular-asymmetric"),
         default="simple",
         help=(
             "Distortion model: simple=k1,k2 only (default, stabler corners), "
-            "full=k1..k3+tangential, k1=radial k1 only"
+            "full=k1..k3+tangential, k1=radial k1 only; angular/angular-asymmetric for fisheye lenses"
         ),
     )
+    parser.add_argument("--radial-terms", type=int, choices=range(1, 5), default=2)
+    parser.add_argument(
+        "--seed-fov",
+        type=float,
+        default=195.0,
+        help="Initial angular FOV across the shorter image dimension",
+    )
+    parser.add_argument(
+        "--max-angle",
+        type=float,
+        default=110.0,
+        help="Angular model maximum half-angle in degrees",
+    )
+    parser.add_argument("--max-evaluations", type=int, default=500)
+    parser.add_argument(
+        "--max-rms",
+        type=float,
+        default=2.0,
+        help="Reject training/validation RMS above this pixel threshold",
+    )
+    parser.add_argument(
+        "--board-definition",
+        type=Path,
+        help="Use board geometry from generate-charuco's .board.json (overrides board flags)",
+    )
+    parser.add_argument(
+        "--validation-every",
+        type=int,
+        default=5,
+        help="Reserve every Nth distinct view before fitting; 0 disables",
+    )
+    parser.add_argument(
+        "--validation-list",
+        type=Path,
+        help="JSON array of reserved image names; overrides periodic splitting",
+    )
+    parser.add_argument(
+        "--observations-in",
+        type=Path,
+        help="Read portable cached observations instead of detecting images",
+    )
+    parser.add_argument(
+        "--observations-out", type=Path, help="Save reusable detections before fitting"
+    )
+    parser.add_argument(
+        "--pixel-policy", choices=["encoded", "legacy-exif"], default="encoded"
+    )
+    parser.add_argument(
+        "--masks",
+        type=Path,
+        help="JSON map of image names to normalized exclusion polygons",
+    )
+    parser.add_argument("--legacy-pattern", action="store_true")
+    parser.add_argument("--first-marker-id", type=int, default=0)
     add_auto_select_arguments(parser)
     parser.set_defaults(handler=run)
 
 
 def format_report(result) -> str:
+    if result.is_angular:
+        return (
+            f"Calibration complete: {result.distortion_model}\n"
+            f"Image size: {result.image_size}; training images: {len(result.used_images)}\n"
+            f"Training RMS: {result.rms_reprojection_error:.4f} px\n"
+            f"Reserved validation RMS: {(result.validation or {}).get('rms_px')} px\n"
+            f"fx/fy: {result.fx:.6f}, {result.fy:.6f}; cx/cy: {result.cx:.6f}, {result.cy:.6f}\n"
+            f"Angular radial coefficients: {result.distortion_coefficients}\n"
+            f"Angular-plane asymmetric coefficients: {result.asymmetric_coefficients}\n"
+            f"Model domain: 0–{result.max_angle_deg:g} degrees off-axis (not a measured lens FOV)\n"
+            "JSON profile; no Brown YAML conversion. Fit remains provisional outside observed coverage."
+        )
     dist = result.distortion_coefficients
     width, height = result.image_size
     center_x = width / 2.0
@@ -218,11 +287,28 @@ def resolve_output_paths(
 
 
 def run(args: argparse.Namespace) -> int:
-    if not args.images.is_dir():
+    if not args.observations_in and not args.images.is_dir():
         print(f"Error: Not a directory: {args.images}", file=sys.stderr)
         return 2
+    try:
+        if args.board_definition:
+            definition = json.loads(args.board_definition.read_text())
+            args.board = "charuco"
+            args.squares_x = definition["squares_x"]
+            args.squares_y = definition["squares_y"]
+            args.square_size = definition["square_mm"]
+            args.marker_proportion = definition["marker_mm"] / args.square_size
+            args.dictionary = definition["dictionary"]
+            args.legacy_pattern = definition.get("legacy_pattern", False)
+            args.first_marker_id = definition.get("first_marker_id", 0)
+    except (OSError, ValueError, KeyError, TypeError, ZeroDivisionError) as error:
+        print(f"Error: Invalid board definition: {error}", file=sys.stderr)
+        return 2
+    if not args.observations_in and args.board not in {"charuco", "checkerboard"}:
+        print("Error: provide --board or --board-definition", file=sys.stderr)
+        return 2
     board_error = validate_board_args(args, require_square_size=True)
-    if board_error:
+    if board_error and not args.observations_in:
         print(f"Error: {board_error}", file=sys.stderr)
         return 2
     if args.auto_select_max_keep is not None and args.auto_select_max_keep < 3:
@@ -230,24 +316,66 @@ def run(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        result = calibrate_from_folder(
-            folder=args.images,
-            board=args.board,
-            square_size=args.square_size,
-            squares_x=args.squares_x,
-            squares_y=args.squares_y,
-            detect_scale=args.detect_scale,
-            preview_dir=args.preview_dir,
-            distortion_model=args.model,
+        from camera_calibration.observations import (
+            load_observations,
+            fit_partitioned,
+            save_observations,
+        )
+        from camera_calibration.masks import load_masks
+
+        reserved = (
+            json.loads(args.validation_list.read_text())
+            if args.validation_list
+            else None
+        )
+        if reserved is not None and (
+            not isinstance(reserved, list)
+            or not all(isinstance(n, str) for n in reserved)
+        ):
+            raise ValueError("validation-list must contain an array of image names")
+        options = dict(
+            validation_every=args.validation_every,
+            reserved=reserved,
             auto_select=args.auto_select,
             auto_select_max_keep=args.auto_select_max_keep,
             auto_select_error_factor=args.auto_select_error_factor,
             auto_select_error_floor=args.auto_select_error_floor,
-            marker_proportion=args.marker_proportion,
-            dictionary=args.dictionary,
-            min_charuco_corners=args.min_charuco_corners,
+            terms=args.radial_terms,
+            seed_fov=args.seed_fov,
+            max_angle=args.max_angle,
+            max_nfev=args.max_evaluations,
+            max_rms=args.max_rms,
         )
-    except (FileNotFoundError, RuntimeError, ValueError) as error:
+        if args.observations_in:
+            if args.masks:
+                raise ValueError(
+                    "Masks must be applied during detection, not to cached observations"
+                )
+            observations = load_observations(args.observations_in)
+            result = fit_partitioned(observations, model=args.model, **options)
+            if args.observations_out:
+                save_observations(observations, args.observations_out)
+        else:
+            result = calibrate_from_folder(
+                folder=args.images,
+                board=args.board,
+                square_size=args.square_size,
+                squares_x=args.squares_x,
+                squares_y=args.squares_y,
+                detect_scale=args.detect_scale,
+                preview_dir=args.preview_dir,
+                distortion_model=args.model,
+                marker_proportion=args.marker_proportion,
+                dictionary=args.dictionary,
+                min_charuco_corners=args.min_charuco_corners,
+                pixel_policy=args.pixel_policy,
+                masks=load_masks(args.masks),
+                legacy_pattern=args.legacy_pattern,
+                first_marker_id=args.first_marker_id,
+                observations_out=args.observations_out,
+                **options,
+            )
+    except (OSError, RuntimeError, ValueError, cv2.error) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
 
@@ -259,10 +387,12 @@ def run(args: argparse.Namespace) -> int:
         args.model,
     )
     result.save_json(json_path)
-    result.save_ros_yaml(yaml_path, camera_name=yaml_camera_name)
+    if not result.is_angular:
+        result.save_ros_yaml(yaml_path, camera_name=yaml_camera_name)
     print(format_report(result))
     print(f"\nWrote {json_path}")
-    print(f"Wrote {yaml_path} (ROS/OpenCV YAML)")
+    if not result.is_angular:
+        print(f"Wrote {yaml_path} (ROS/OpenCV YAML)")
     if args.preview_dir is not None:
         print(f"Wrote corner previews to {args.preview_dir}")
     return 0

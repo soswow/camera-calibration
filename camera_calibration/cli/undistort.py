@@ -45,6 +45,20 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             "0=crop black borders (default), 1=keep all pixels"
         ),
     )
+    parser.add_argument(
+        "--projection",
+        choices=["perspective", "equirectangular"],
+        default="perspective",
+    )
+    parser.add_argument(
+        "--fov",
+        type=float,
+        default=100.0,
+        help="Perspective horizontal FOV for angular models (degrees)",
+    )
+    parser.add_argument("--yaw", type=float, default=0.0)
+    parser.add_argument("--pitch", type=float, default=0.0)
+    parser.add_argument("--size", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"))
     parser.set_defaults(handler=run)
 
 
@@ -66,6 +80,11 @@ def run(args: argparse.Namespace) -> int:
             calibration=calibration,
             output=args.output,
             alpha=args.alpha,
+            projection=args.projection,
+            fov=args.fov,
+            yaw=args.yaw,
+            pitch=args.pitch,
+            output_size=tuple(args.size) if args.size else None,
         )
     except (FileNotFoundError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(f"Error: {error}", file=sys.stderr)

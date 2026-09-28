@@ -1,5 +1,6 @@
-opencv-contrib-python>=4.7
+opencv-contrib-python<6,>=4.10
 numpy>=1.23
+scipy<2,>=1.14
 Pillow>=10.0
 reportlab>=3.6
 matplotlib>=3.8.0

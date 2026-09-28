@@ -16,7 +16,9 @@ def _camera_arrays(
     calibration: CalibrationResult,
 ) -> tuple[np.ndarray, np.ndarray]:
     camera_matrix = np.asarray(calibration.camera_matrix, dtype=np.float64)
-    dist_coeffs = np.asarray(calibration.distortion_coefficients, dtype=np.float64).reshape(-1)
+    dist_coeffs = np.asarray(
+        calibration.distortion_coefficients, dtype=np.float64
+    ).reshape(-1)
     return camera_matrix, dist_coeffs
 
 
@@ -61,7 +63,9 @@ def distort_points(
     return projected.reshape(-1, 2)
 
 
-def _grid_polylines(width: int, height: int, steps: int = 13, samples: int = 80) -> list[np.ndarray]:
+def _grid_polylines(
+    width: int, height: int, steps: int = 13, samples: int = 80
+) -> list[np.ndarray]:
     """Regular pixel-space grid as dense polylines (ideal / undistorted).
 
     Outer lines are inset so stroke width cannot paint over the axis spines.
@@ -184,7 +188,9 @@ def _lock_image_axes(axis, width: int, height: int):
     axis.set_axisbelow(False)
     for spine in axis.spines.values():
         spine.set_zorder(20)
-    frame = Rectangle((0, 0), width, height, fill=False, edgecolor="0.4", linewidth=1.0, zorder=21)
+    frame = Rectangle(
+        (0, 0), width, height, fill=False, edgecolor="0.4", linewidth=1.0, zorder=21
+    )
     axis.add_patch(frame)
     return frame
 
@@ -257,7 +263,9 @@ def _clip_polyline_to_rect(
 
 def _plot_clipped(axis, xs, ys, width: int, height: int, **plot_kwargs):
     """Draw a polyline clipped to the sensor rectangle."""
-    points = np.column_stack((np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64)))
+    points = np.column_stack(
+        (np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64))
+    )
     pieces = _clip_polyline_to_rect(points, float(width), float(height))
     line = None
     for piece in pieces:
@@ -329,6 +337,8 @@ def render_distortion_figure(
     4) Downsampled displacement quiver
     5) Printed K / D / FOV / λ
     """
+    if calibration.is_angular:
+        return render_angular_figure(calibration, path)
     import matplotlib
 
     matplotlib.use("Agg")
@@ -340,7 +350,9 @@ def render_distortion_figure(
     width, height = calibration.image_size
     camera_matrix, dist_coeffs = _camera_arrays(calibration)
     k1, k2, p1, p2, k3 = _brown_coeffs(dist_coeffs)
-    dest_x, dest_y, disp_dx, disp_dy, magnitude = undistort_displacement_maps(calibration)
+    dest_x, dest_y, disp_dx, disp_dy, magnitude = undistort_displacement_maps(
+        calibration
+    )
     max_disp = float(np.nanmax(magnitude))
     profiles = _radial_profiles(calibration)
 
@@ -459,7 +471,11 @@ def render_distortion_figure(
         label="corner",
     )
     axis_radial.plot(
-        r_u, profiles["delta_px_brown"], color="#c0392b", linewidth=2.0, label="Brown–Conrady radial"
+        r_u,
+        profiles["delta_px_brown"],
+        color="#c0392b",
+        linewidth=2.0,
+        label="Brown–Conrady radial",
     )
     if "delta_px_fitz" in profiles:
         axis_radial.plot(
@@ -533,13 +549,14 @@ def render_undistort_comparison(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    calibration_image = read_calibration_image(image_path)
+    calibration_image = read_calibration_image(image_path, calibration.pixel_policy)
     if calibration_image is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
 
     sized = normalize_to_calibration_size(
         calibration_image.image,
         calibration.image_size,
+        calibration.pixel_policy,
     )
     if sized is None:
         raise ValueError(
@@ -558,14 +575,28 @@ def render_undistort_comparison(
     figure.suptitle(f"Undistort preview  ·  {image_path.name}  ·  alpha={alpha:g}")
 
     axes[0].imshow(rgb_original)
-    axes[0].set_title("Captured + straight-grid-as-seen-by-lens")
-    for polyline in _grid_polylines(width, height, steps=11, samples=60):
+    axes[0].set_title(
+        "Captured"
+        if calibration.is_angular
+        else "Captured + straight-grid-as-seen-by-lens"
+    )
+    for polyline in (
+        []
+        if calibration.is_angular
+        else _grid_polylines(width, height, steps=11, samples=60)
+    ):
         warped = distort_points(polyline, camera_matrix, dist_coeffs)
         for piece in _clip_polyline_to_rect(warped, float(width), float(height)):
-            axes[0].plot(piece[:, 0], piece[:, 1], color="#ffee58", linewidth=0.7, alpha=0.85)
+            axes[0].plot(
+                piece[:, 0], piece[:, 1], color="#ffee58", linewidth=0.7, alpha=0.85
+            )
 
     axes[1].imshow(rgb_undistorted)
-    axes[1].set_title("After undistort (look for straightened lines)")
+    axes[1].set_title(
+        "Perspective crop: 100 degrees horizontal"
+        if calibration.is_angular
+        else "After undistort (look for straightened lines)"
+    )
 
     for axis in axes:
         axis.set_axis_off()
@@ -574,3 +605,60 @@ def render_undistort_comparison(
     figure.savefig(output_path, dpi=120)
     plt.close(figure)
     return output_path
+
+
+def render_angular_figure(calibration, path):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from .models import model_for, radial, derivative
+
+    m = model_for(calibration)
+    m.check_domain()
+    figure, axes = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True)
+    theta = np.linspace(0, np.deg2rad(m.max_angle_deg), 300)
+    for az in np.linspace(-np.pi, np.pi, 25):
+        rays = np.column_stack(
+            (np.sin(theta) * np.cos(az), np.sin(theta) * np.sin(az), np.cos(theta))
+        )
+        pixels = m.project_rays(rays)
+        axes[0].plot(*pixels.T, linewidth=0.6)
+    for angle in np.linspace(0, m.max_angle_deg, 12)[1:]:
+        az = np.linspace(-np.pi, np.pi, 300)
+        t = np.deg2rad(angle)
+        rays = np.column_stack(
+            (
+                np.sin(t) * np.cos(az),
+                np.sin(t) * np.sin(az),
+                np.full(len(az), np.cos(t)),
+            )
+        )
+        axes[0].plot(*m.project_rays(rays).T, color="gray", linewidth=0.6)
+    width, height = calibration.image_size
+    axes[0].set(
+        xlim=(0, width),
+        ylim=(height, 0),
+        title="Angular grid in input pixels",
+        xlabel="x (px)",
+        ylabel="y (px)",
+    )
+    axes[0].set_aspect("equal")
+    axes[1].plot(np.degrees(theta), radial(theta, m.coefficients))
+    axes[1].set(
+        title="Radial mapping before asymmetry",
+        xlabel="Off-axis angle (degrees)",
+        ylabel="Angular-plane radius",
+    )
+    axes[2].plot(np.degrees(theta), derivative(theta, m.coefficients))
+    axes[2].axhline(0, color="red")
+    axes[2].set(
+        title="Radial derivative (must stay positive)",
+        xlabel="Off-axis angle (degrees)",
+    )
+    figure.suptitle(f"{m.name}; mathematical domain, not measured coverage")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=140)
+    plt.close(figure)
+    return path

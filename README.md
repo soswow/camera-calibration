@@ -1,8 +1,11 @@
 # Camera Calibration
 
-Tools for **ChArUco** and **checkerboard** camera calibration: print a board, capture photos, estimate intrinsics, export JSON / ROS YAML, undistort, and visualize distortion. PS3 Eye live capture and preview helpers are included too.
+Tools for **ChArUco** and **checkerboard** calibration of perspective and fisheye lenses from ordinary single-camera images: print a board, capture photos, estimate intrinsics, export JSON / ROS YAML, undistort, and visualize distortion. PS3 Eye live capture and preview helpers are included too.
 
 Each tool lives in its own folder with a full README (flags, examples, notes). Implementation is in `camera_calibration/`; run everything from the repo root.
+
+**Fisheye support:** see the [single-image workflow](docs/fisheye.md) for angular
+and asymmetric models, stable validation, cached observations and spherical output.
 
 ## Setup
 
@@ -55,10 +58,9 @@ python -m camera_calibration visualize output/ps3eye-charuco-simple.json
 
 Count **squares** (not inner corners) for both board types. `--square-size` is the measured edge of one square.
 
-Calibration reads encoded pixels and applies the inverse EXIF display
-orientation, so phone portrait/landscape shots can share one camera pixel frame
-without guessing a rotation from width/height alone. Images whose normalized
-dimensions still differ are rejected from one calibration set.
+New calibrations use encoded pixels and ignore EXIF display orientation. Images
+with different dimensions are rejected rather than rotated to fit. Legacy
+profiles retain their previous loading policy. See [coordinate policies](docs/fisheye.md#profiles-and-coordinates).
 
 ## Layout
 

@@ -3,7 +3,12 @@
 from .calibrate import calibrate_from_folder, collect_board_detections
 from .diagnose import DiagnosisReport, diagnose_calibration, render_diagnosis_image
 from .result import CalibrationResult
-from .undistort import UndistortBatchResult, load_calibration, undistort_image, undistort_path
+from .undistort import (
+    UndistortBatchResult,
+    load_calibration,
+    undistort_image,
+    undistort_path,
+)
 from .validate import ValidationReport, render_validation_overlay, validate_calibration
 from .visualize import render_distortion_figure, render_undistort_comparison
 
@@ -23,4 +28,17 @@ __all__ = [
     "undistort_image",
     "undistort_path",
     "validate_calibration",
+]
+
+from .models import CameraModel, model_for
+from .observations import load_observations, save_observations, fit_partitioned
+from .render import remap_view
+
+__all__ += [
+    "CameraModel",
+    "model_for",
+    "load_observations",
+    "save_observations",
+    "fit_partitioned",
+    "remap_view",
 ]

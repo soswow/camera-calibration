@@ -87,3 +87,6 @@ Tiled output requires PDF format.
 - Print a reference ruler and verify scale
 - After printing, measure square size; target error < 0.5 mm. Use that measurement with [`calibrate`](../calibrate/README.md).
 - Mount to a flat surface; do not laminate
+
+The generator also writes a `.board.json` sidecar for `calibrate --board-definition`.
+`--first-marker-id` and `--legacy-pattern` are shared with ChArUco detection.
