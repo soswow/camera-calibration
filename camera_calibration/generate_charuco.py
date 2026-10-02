@@ -290,7 +290,7 @@ def _render_board(board, size: tuple[int, int], margin_px: int, border_bits: int
         raise
 
 
-def _mm_to_px(mm: float, dpi: int) -> int:
+def _mm_to_px(mm: float, dpi: float) -> int:
     return int(round(mm / 25.4 * dpi))
 
 
@@ -404,11 +404,10 @@ def _draw_pdf_margin_details(
     x1 = board_x1_pt if board_x1_pt is not None else page_w_pt
     board_bottom = board_y0_pt if board_y0_pt is not None else margin_pt
     usable = max(x1 - x0, page_w_pt * 0.5)
-    max_font = min(9.0, margin_pt * 0.5)
     min_font = 3.5
-    font_pt = max_font
+    font_pt = max(min_font, min(9.0, margin_pt * 0.5))
     while font_pt > min_font and pdf.stringWidth(text, "Helvetica", font_pt) > usable:
-        font_pt -= 0.25
+        font_pt = max(min_font, font_pt - 0.25)
     pdf.setFont("Helvetica", font_pt)
     pdf.setFillColorRGB(DETAIL_GRAY, DETAIL_GRAY, DETAIL_GRAY)
     gap = max(1.0, font_pt * 0.25)
@@ -552,7 +551,7 @@ def _square_snapped_spans_mm(
     return spans or [total_mm]
 
 
-def _spans_mm_to_px(spans_mm: list[float], total_px: int, dpi: int) -> list[int]:
+def _spans_mm_to_px(spans_mm: list[float], total_px: int, dpi: float) -> list[int]:
     if not spans_mm:
         return [total_px] if total_px > 0 else []
     spans_px = [max(0, _mm_to_px(span, dpi)) for span in spans_mm]
@@ -1134,18 +1133,19 @@ def main(argv: list[str] | None = None) -> int:
                 raise SystemExit(
                     "margin is too large for the selected tile paper size."
                 )
-            # --size/--paper is the checkerboard area. Tiles only slice that area for printing.
+        if size_provided:
+            # A custom size describes the board canvas itself; tile margins
+            # are included inside each physical tile sheet.
             available_w = paper_width_mm
             available_h = paper_height_mm
         else:
-            if size_provided:
-                available_w = paper_width_mm
-                available_h = paper_height_mm
-            else:
-                available_w = paper_width_mm - 2 * args.margin
-                available_h = paper_height_mm - 2 * args.margin
-                if available_w <= 0 or available_h <= 0:
-                    raise SystemExit("margin is too large for the selected paper size.")
+            # A named paper size includes its outer margins, with or without
+            # tiling. Otherwise paper == tile-paper produces overflow pages
+            # just to hold the main canvas's blank outer edges.
+            available_w = paper_width_mm - 2 * args.margin
+            available_h = paper_height_mm - 2 * args.margin
+            if available_w <= 0 or available_h <= 0:
+                raise SystemExit("margin is too large for the selected paper size.")
 
         if squares_provided:
             squares_x = args.squares_x
@@ -1158,10 +1158,41 @@ def main(argv: list[str] | None = None) -> int:
                     squares_x * square_size > available_w + 1e-6
                     or squares_y * square_size > available_h + 1e-6
                 ):
-                    raise SystemExit(
-                        "Exact --square-size with these square counts does not fit "
-                        "the printable area."
+                    max_square = min(available_w / squares_x, available_h / squares_y)
+                    max_squares_x = int(math.floor(available_w / square_size + 1e-9))
+                    max_squares_y = int(math.floor(available_h / square_size + 1e-9))
+                    bounds = (
+                        f"--paper {paper_label}, {_fmt_mm(args.margin)}mm margin on each edge"
+                        if paper_provided else f"--size {args.size}"
                     )
+                    message = (
+                        "Exact --square-size with these square counts does not fit "
+                        "the printable area.\n"
+                        f"  Requested: {squares_x} x {squares_y} squares at "
+                        f"{_fmt_mm(square_size)}mm = "
+                        f"{_fmt_mm(squares_x * square_size)} x "
+                        f"{_fmt_mm(squares_y * square_size)}mm.\n"
+                        f"  Available: {_fmt_mm(available_w)} x {_fmt_mm(available_h)}mm "
+                        f"({bounds}).\n"
+                        f"  For {squares_x} x {squares_y} squares, use --square-size "
+                        f"{_fmt_mm_floor(max_square, decimals=6)} or smaller.\n"
+                        f"  At {_fmt_mm(square_size)}mm, at most {max_squares_x} x "
+                        f"{max_squares_y} squares fit (X x Y)."
+                    )
+                    if max_squares_x < 2 or max_squares_y < 2:
+                        message += " This is too small for a ChArUco board (minimum 2 x 2)."
+                    if tile_paper_provided:
+                        required_size = (
+                            f"{_fmt_mm(squares_x * square_size)}x"
+                            f"{_fmt_mm(squares_y * square_size)}"
+                        )
+                        message += (
+                            f"\n  To keep the requested board, replace "
+                            f"{'--paper' if paper_provided else '--size'} with "
+                            f"--size {required_size}. --tile-paper {tile_label} sets "
+                            "individual sheet size, not the main board size."
+                        )
+                    raise SystemExit(message)
             else:
                 square_size = min(available_w / squares_x, available_h / squares_y)
                 fill_to_paper = True
@@ -1205,18 +1236,19 @@ def main(argv: list[str] | None = None) -> int:
     tile_x_spans_mm: list[float] | None = None
     tile_y_spans_mm: list[float] | None = None
     if tile_paper_provided:
-        origin_x_mm = max(0.0, (available_w - board_width_mm) / 2.0)
-        origin_y_mm = max(0.0, (available_h - board_height_mm) / 2.0)
+        # The main paper/canvas bounds determine which board fits. Tile only
+        # the actual checkerboard, so unused surrounding white space cannot
+        # create extra sheets or change orientation as square counts change.
+        output_width_mm = board_width_mm
+        output_height_mm = board_height_mm
         tile_width_mm, tile_height_mm, tile_x_spans_mm, tile_y_spans_mm = (
             _choose_tile_layout(
-                available_w,
-                available_h,
+                board_width_mm,
+                board_height_mm,
                 tile_width_mm,
                 tile_height_mm,
                 args.margin,
                 square_size,
-                origin_x_mm,
-                origin_y_mm,
             )
         )
         tile_cols = len(tile_x_spans_mm)
@@ -1308,13 +1340,13 @@ def main(argv: list[str] | None = None) -> int:
         board_w_px, board_h_px = _board_pixel_size(
             squares_x, squares_y, square_size, args.dpi
         )
-        canvas_w_px = max(_mm_to_px(available_w, args.dpi), board_w_px)
-        canvas_h_px = max(_mm_to_px(available_h, args.dpi), board_h_px)
-        board_img = _render_board(board, (board_w_px, board_h_px), 0, border_bits=1)
-        canvas_img = np.full((canvas_h_px, canvas_w_px), 255, dtype=board_img.dtype)
-        _center_paste(canvas_img, board_img)
-        col_spans_px = _spans_mm_to_px(tile_x_spans_mm, canvas_w_px, args.dpi)
-        row_spans_px = _spans_mm_to_px(tile_y_spans_mm, canvas_h_px, args.dpi)
+        canvas_w_px, canvas_h_px = board_w_px, board_h_px
+        canvas_img = _render_board(board, (board_w_px, board_h_px), 0, border_bits=1)
+        # Raster squares are rounded individually. Use that same conversion
+        # for cuts, rather than rounding entire nominal millimetre spans.
+        raster_dpi = board_w_px * 25.4 / board_width_mm
+        col_spans_px = _spans_mm_to_px(tile_x_spans_mm, canvas_w_px, raster_dpi)
+        row_spans_px = _spans_mm_to_px(tile_y_spans_mm, canvas_h_px, raster_dpi)
         _write_tiled_pdf(
             output_path,
             canvas_img,

@@ -24,8 +24,8 @@ python generate-charuco/generate_charuco.py --help   # same CLI (shim)
 | `--target-square-size` | unset (`> 0`) | Target square side in millimetres. With `--paper`/`--size` and no square counts, picks how many squares fit then resizes them to fill the page. Cannot be used with `--square-size`. |
 | `--marker-proportion` | `0.7` (`(0, 1)`) | Marker side length as a fraction of square size. |
 | `--dictionary` | `auto` (OpenCV `DICT_*`) | ArUco dictionary. `auto` picks the smallest 4X4 dictionary that has enough marker IDs. |
-| `--paper` | unset (`A0`, `A1`, `A2`, `A3`, `A4`, `LETTER`, `LEGAL`, `TABLOID`) | Main board size by paper name. Cannot be combined with `--size`. |
-| `--size` | unset (`WIDTHxHEIGHT` mm) | Board area in millimetres, e.g. `480x720`. Squares are packed into this rectangle. `--tile-paper` only slices it for printing. Cannot be combined with `--paper`. |
+| `--paper` | unset (`A0`, `A1`, `A2`, `A3`, `A4`, `LETTER`, `LEGAL`, `TABLOID`) | Main paper size, including outer margins. The board fits inside those margins, also when tiled. Cannot be combined with `--size`. |
+| `--size` | unset (`WIDTHxHEIGHT` mm) | Board bounds in millimetres, e.g. `480x720`. Squares are packed into this rectangle. Tiling omits unused white space around the checkerboard. Cannot be combined with `--paper`. |
 | `--tile-paper` | unset (same names as `--paper`) | Tile page size for multi-page PDF output. Requires `--paper` or `--size`. Rotates the tile sheet if that covers the main board with fewer pages. |
 | `--dpi` | `300` (`> 0`) | Render resolution used to convert millimetres to pixels. |
 | `--margin` | `0` mm (`>= 0`) | Inset on each tile page, or around the board on a single-page `--paper`/`--size` run. When greater than 0, a 30% black legend is drawn just below the board on the bottom-left tile only. |
@@ -72,9 +72,9 @@ python -m camera_calibration generate-charuco \
 
 Tiled output requires PDF format.
 
-- `--tile-paper` requires `--paper` or `--size` (the board area). It does not change that area; it only splits it across tile pages.
+- `--tile-paper` requires `--paper` or `--size`. With `--paper`, the board must fit within the paper size minus `--margin` on each edge. With `--size`, it must fit within the exact specified dimensions. Tiling uses the actual checkerboard dimensions and omits unused white space around it, preventing empty pages. Tile margins are inside the tile paper size; they never enlarge its PDF pages. For example, a 5×5 board with 30 mm squares and `--paper A3 --tile-paper A3 --margin 2` uses one A3 page, with the 150×150 mm board centered on it.
 - Tile cuts snap to square borders when a square would not fully fit on the current page, so that square moves to the next tile instead of being sliced.
-- Tile sheets are rotated when landscape needs fewer pages. `--paper A2 --tile-paper A3` is two landscape A3 pages, not one portrait page.
+- Tile sheets are rotated when landscape needs fewer pages. Page counts account for the printable area and square-snapped cuts; margins can require additional sheets even when the paper sizes alone would suggest fewer.
 - `--margin` is the minimum inset on each tile page (and around the board on a single-page `--paper`/`--size` run). A tile slice shorter than the printable area is centered on that page, so leftover space is equal on the left and right, and equal on the top and bottom. When margin is set, a 30% black details line is drawn just below the board on the bottom-left tile only.
 - `--tile-bleed` must be `<=` margin. Default bleed is 2 mm; default crop mark length is 5 mm.
 - A minimap PNG is written next to the PDF with `_minimap.png` suffix.
